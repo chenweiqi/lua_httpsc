@@ -1,24 +1,15 @@
 local httpsc = require "httpsc"
 local internal = require "internal"
 
-for k,v in pairs(httpsc ) do
-	print(k,v)
+local fd = httpsc.connect("163.177.151.109", 443)
+
+while true do
+	local ok = httpsc.check_connect(fd)
+	if ok then break end
+	httpsc.usleep(10000)
 end
 
-local fd = httpsc.connect("163.177.151.109", 443)
--- print(fd)
-
--- local fd = httpsc.connect("124.192.136.131", 443)
 print(fd)
-
--- local fd2 = httpsc.connect("163.177.151.109", 443)
--- print(fd2)
-
--- httpsc.usleep(10000)
--- httpsc.send(fd, "GET / HTTP/1.1\r\nAccept: */*\r\nHost: www.baidu.com\r\ncontent-length:0\r\nConnection: Close\r\n\r\n")
-
--- httpsc.usleep(10000)
--- httpsc.send(fd, "GET / HTTP/1.1\r\nAccept: */*\r\nHost: www.jd.com\r\nConnection: Close\r\n\r\n")
 
 function request(method, host, url, recvheader, header, content)
 	local read = function()
@@ -84,8 +75,6 @@ function request(method, host, url, recvheader, header, content)
 			error("Invalid response body")
 		end
 	else
-		-- identity mode
-		
 		print(length)
 		if length then
 			if #body >= length then
