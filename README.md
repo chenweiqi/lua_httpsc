@@ -3,7 +3,9 @@ An asynchronous https library for lua
 
 
 ## API
+```lua
 local httpsc = require "httpsc"
+```
 
 ### Connect remote https server
 ```lua
@@ -36,3 +38,6 @@ httpsc.close(fd)
 
 ## Example
 See test.lua
+
+## Defect
+Only single-threaded support now
