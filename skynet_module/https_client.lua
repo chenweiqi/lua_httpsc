@@ -4,7 +4,13 @@ local httpsc = require "httpsc"
 local internal = require "http.internal"
 local dns = require "dns"
 
-local skynet_util = {}
+local retry_time = 20      -- 超时重试次数
+local retry_time_base = 5  -- 多久(单位0.1秒)重试一次
+local timeout = 15         -- 连接超时(单位1秒)
+local timeout_connect = 3  -- 创建连接超时(单位1秒)
+local read_wait = 10       -- 读不到数据时的等待时间(单位0.01秒)，让出调度权
+
+
 local requests = {}
 local connections = {}
 
@@ -31,7 +37,7 @@ local logger = {
 }
 
 local host_cache = {}
-local getip = function(host, is_fresh)
+local function getip(host, is_fresh)
     if not is_fresh and host_cache[host] then
         return host_cache[host]
     end
@@ -45,11 +51,11 @@ local getip = function(host, is_fresh)
     return host_cache[host]
 end
 
-
-local retry_time = 25      -- 超时重试次数
-local retry_time_base = 4  -- 多久(单位0.1秒)重试一次
-local timeout = 15         -- 连接超时(单位1秒)
-local read_wait = 10       -- 读不到数据时的等待时间(单位0.01秒)，让出调度权
+local function handle_err(e)
+    e = debug.traceback(coroutine.running(), tostring(e), 2)
+    skynet.error(e)
+    return e
+end
 
 local function recv_data(request)
     if request.step >= req_step.finish then
@@ -59,7 +65,6 @@ local function recv_data(request)
         local data = httpsc.recv(request.fd, size)
         if not data then
             skynet.sleep(read_wait)
-            data = httpsc.recv(request.fd, size)
         end
         return data or ""
     end
@@ -147,12 +152,12 @@ local function finish_request(requests, request, ret, step)
         request.ret = ret
         request.step = step
         requests[request.co] = nil
-        xpcall(skynet.wakeup, skynet_util.handle_err, request.co)
+        xpcall(skynet.wakeup, handle_err, request.co)
     end
 end
 
 local function do_timeout()
-    local interval = 10*100
+    local interval = 2*100
     while true do
         skynet.sleep(interval)
         local now = os.time()
@@ -162,7 +167,7 @@ local function do_timeout()
             end
         end
         for co, connection in pairs(connections) do
-            if now - connection.time > timeout then
+            if now - connection.time > timeout_connect then
                 connections[co] = nil
                 connection.error = "connecting timeout"
                 pcall(httpsc.close, connection.fd)
@@ -276,7 +281,7 @@ local function raw_request(method, host, url, header, content)
     end
 
     --perform request
-    local ok = xpcall(request, skynet_util.handle_err, fd, method, host, url, header, content)
+    local ok = xpcall(request, handle_err, fd, method, host, url, header, content)
     if not ok then
         pcall(httpsc.close, fd)
         return false
@@ -288,18 +293,15 @@ end
 local function raw_read(request)
     local retry_time_s = retry_time_base * 10
     for k =1, retry_time do
-        if request.step < req_step.finish then
-            local ok, err = pcall(recv_data, request)
-            if not ok then
-                logger.err("https_client recv data fail, err = %s", err)
-                finish_request(requests, request, "recv_data error", req_step.error)
-                return
-            else
-                if request.step == req_step.finish then
-                    finish_request(requests, request, request.body, req_step.finish)
-                    return
-                end
-            end
+        local ok, err = pcall(recv_data, request)
+        if not ok then
+            logger.err("https_client recv data fail, err = %s", err)
+            finish_request(requests, request, "recv_data error", req_step.error)
+            return
+        end
+        if request.step >= req_step.finish then
+            finish_request(requests, request, request.body, request.step)
+            return
         end
         skynet.sleep(retry_time_s)
     end
@@ -310,7 +312,7 @@ end
 -- @treturn bool 请求是否成功
 -- @treturn string 当成功时，返回内容，当失败时，返回出错原因 
 function command.request(method, host, url, header, content)
-    local ok, is_ok, fd = xpcall(raw_request, skynet_util.handle_err, method, host, url, header, content)
+    local ok, is_ok, fd = xpcall(raw_request, handle_err, method, host, url, header, content)
     if not ok then
         logger.err("https_client request fail, host = %s, url = %s, err = %s", host, url, is_ok)
         return false, "request connection fail"
@@ -363,7 +365,7 @@ function command.post(host, url, form)
     return command.request("POST", host, url, header, table.concat(body , "&"))
 end
 
-function skynet_util.lua_docmd(cmdhandler, session, cmd, ...)
+local function lua_docmd(cmdhandler, session, cmd, ...)
 	local f = cmdhandler[cmd]
 	if not f then
 		return error(string.format("%s Unknown command %s", SERVICE_NAME, tostring(cmd)))
@@ -373,12 +375,6 @@ function skynet_util.lua_docmd(cmdhandler, session, cmd, ...)
 	else
 		return skynet.ret(skynet.pack(f(...)))
 	end
-end
-
-function skynet_util.handle_err(e)
-	e = debug.traceback(coroutine.running(), tostring(e), 2)
-	skynet.error(e)
-	return e
 end
 
 
@@ -392,7 +388,7 @@ skynet.start(function()
     skynet.fork(do_clean)
 
     skynet.dispatch("lua", function (session, source, cmd, ...)
-        return skynet_util.lua_docmd(command, session, string.lower(cmd), ...)
+        return lua_docmd(command, session, string.lower(cmd), ...)
     end)
 
 
