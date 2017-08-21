@@ -104,29 +104,29 @@ function M.recvchunkedbody(readbytes, bodylimit, header, body)
 	local result = ""
 	local size = 0
 
+	local sz
 	while true do
-		local sz
-		sz , body = chunksize(readbytes, body)
+		if sz then
+			body = body .. readbytes(sz - #body)
+			if #body >= sz then
+				result = result .. body:sub(1,sz)
+				body = body:sub(sz+1)
+				body = readcrln(readbytes, body)
+				if not body then
+					return
+				end
+				sz = nil
+			end
+		end
+
 		if not sz then
-			return
-		end
-		if sz == 0 then
-			break
-		end
-		size = size + sz
-		if bodylimit and size > bodylimit then
-			return
-		end
-		if #body >= sz then
-			result = result .. body:sub(1,sz)
-			body = body:sub(sz+1)
-		else
-			result = result .. body .. readbytes(sz - #body)
-			body = ""
-		end
-		body = readcrln(readbytes, body)
-		if not body then
-			return
+			sz , body = chunksize(readbytes, body)
+			if not sz then
+				return
+			end
+			if sz == 0 then
+				break
+			end
 		end
 	end
 
