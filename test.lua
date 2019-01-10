@@ -9,7 +9,7 @@ while true do
 	httpsc.usleep(10000)
 end
 
-print(fd)
+-- print(fd)
 
 function request(method, host, url, recvheader, header, content)
 	local read = function()
@@ -17,7 +17,7 @@ function request(method, host, url, recvheader, header, content)
 	end
 
 	local write = function(msg)
-		httpsc.send(fd, msg)
+		return httpsc.send(fd, msg)
 	end
 
 
@@ -33,12 +33,25 @@ function request(method, host, url, recvheader, header, content)
 		header_content = string.format("host:%s\r\n",host)
 	end
 
+	local data
 	if content then
-		local data = string.format("%s %s HTTP/1.1\r\n%scontent-length:%d\r\n\r\n%s", method, url, header_content, #content, content)
-		write(data)
+		data = string.format("%s %s HTTP/1.1\r\n%scontent-length:%d\r\n\r\n%s", method, url, header_content, #content, content)
 	else
-		local request_header = string.format("%s %s HTTP/1.1\r\n%scontent-length:0\r\n\r\n", method, url, header_content)
-		write(request_header)
+		data = string.format("%s %s HTTP/1.1\r\n%scontent-length:0\r\n\r\n", method, url, header_content)
+	end
+	-- print(#data)
+	-- print(data)
+
+	while true do
+		local send_len = write(data)
+		if send_len > 0 then
+			if send_len >= #data then
+				break
+			end
+			data = data:sub(send_len+1)
+		else
+			httpsc.usleep(1000)
+		end
 	end
 
 	httpsc.usleep(1000000)
@@ -75,7 +88,7 @@ function request(method, host, url, recvheader, header, content)
 			error("Invalid response body")
 		end
 	else
-		print(length)
+		-- print(length)
 		if length then
 			if #body >= length then
 				body = body:sub(1,length)

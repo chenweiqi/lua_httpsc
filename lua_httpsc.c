@@ -51,18 +51,19 @@ typedef struct {
 	int is_init;
 } cutil_conf_t;
 
-enum conn_st
+enum cutil_conn_st
 {
 	CONNECT_INIT = 1,
 	CONNECT_PORT = 2,
 	CONNECT_SSL = 3,
-	CONNECT_DONE = 4
+	CONNECT_DONE = 4,
+	CONNECT_CLOSE = 5,
 };
 
 typedef struct {
 	int fd;
 	SSL* ssl;
-	enum conn_st status;
+	enum cutil_conn_st status;
 } cutil_fd_t;
 
 static cutil_conf_t* fetch_config(lua_State *L) {
@@ -74,30 +75,45 @@ static cutil_conf_t* fetch_config(lua_State *L) {
 	return cfg;
 }
 
-static void close_fd_t(cutil_fd_t* fd_t) {
+static void close_fd_t(lua_State *L, cutil_fd_t* fd_t) {
 	if ( fd_t == NULL )
 		return;
+	if ( fd_t->status == CONNECT_CLOSE )
+		return;
+	enum cutil_conn_st status = fd_t->status;
+	fd_t->status = CONNECT_CLOSE;
 
 	SSL* ssl = fd_t->ssl;
 	if ( ssl != NULL ) {
-		SSL_shutdown(ssl);
-		SSL_free(ssl);
+/*
+ *	Possible error: 
+ *	"error:140E0197:SSL routines:SSL_shutdown:shutdown while in init" error while attempting an SSL_shutdown?
+ *
+ *	OpenSSL 1.0.2f complains if SSL_shutdown() is called during an SSL handshake, while previous versions always return 0.
+ *	Avoid calling SSL_shutdown() if handshake wasn't completed.
+ */
+		if ( status >= CONNECT_DONE )
+			SSL_shutdown(ssl);
+		if ( status >= CONNECT_SSL )
+			SSL_free(ssl);
+		fd_t->ssl = NULL;
 	}
-	
+
 	int fd = fd_t->fd;
-	if (fd != ERROR_FD)
+	if (fd != ERROR_FD) {
 		close(fd);
+		fd_t->fd = ERROR_FD;
+	}
 
 	free(fd_t);
 }
 
 static int try_connect_ssl(SSL* ssl) {
-	int ret,err;
-	ret = SSL_connect(ssl);
-	err = SSL_get_error(ssl, ret);
+	int ret = SSL_connect(ssl);
 	if (ret == 1) 
 		return 0;
 
+	int err = SSL_get_error(ssl, ret);
 	if (err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_WANT_READ ) {
 		return -1;
 	}
@@ -137,7 +153,7 @@ static int lconnect(lua_State *L) {
 	socklen_t len = sizeof(timeo);
 	ret = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeo, len);
 	if (ret) {
-		close_fd_t(fd_t);
+		close_fd_t(L, fd_t);
 		return luaL_error(L, "httpsc: Setsockopt %s %d failed", addr, port);
 	}
 
@@ -149,7 +165,7 @@ static int lconnect(lua_State *L) {
 		if (errno == EINPROGRESS) {
 			fd_t->status = CONNECT_PORT;
 		} else {
-			close_fd_t(fd_t);
+			close_fd_t(L, fd_t);
 			return luaL_error(L, "httpsc: Connect %s %d failed", addr, port);
 		}
 
@@ -162,13 +178,12 @@ static int lconnect(lua_State *L) {
 		if (ret == 0) {
 			fd_t->status = CONNECT_DONE;
 		} else if (ret == -1) {
-			close_fd_t(fd_t);
+			close_fd_t(L, fd_t);
 			return luaL_error(L, "httpsc ssl_connect error, errno = %d", errno);
 		}
 	}
 	
 	lua_pushlightuserdata(L, fd_t);
-
 	return 1;
 }
 
@@ -194,7 +209,7 @@ static int lcheck_connect(lua_State *L) {
 					socklen_t len = sizeof(int);
 					ret = getsockopt(fd_t->fd, SOL_SOCKET, SO_ERROR, &err, &len);
 					if (ret < 0) {
-						close_fd_t(fd_t);
+						close_fd_t(L, fd_t);
 						return luaL_error(L, "httpsc getsockopt error, ret = %d", ret);
 					}
 					if (err == 0) {
@@ -208,19 +223,19 @@ static int lcheck_connect(lua_State *L) {
 							lua_pushboolean(L, 1);
 							return 1;
 						} else if (ret == -1) {
-							close_fd_t(fd_t);
+							close_fd_t(L, fd_t);
 							return luaL_error(L, "httpsc connect ssl error, errno = %d", errno);
 						}
 					} else {
 						if (errno == EAGAIN || errno == EINTR || errno == EINPROGRESS ) {
 							return 0;
 						} else {
-							close_fd_t(fd_t);
+							close_fd_t(L, fd_t);
 							return luaL_error(L, "httpsc connect sockopt error, errno = %d", errno);
 						}
 					}
 				} else {
-					close_fd_t(fd_t);
+					close_fd_t(L, fd_t);
 					return luaL_error(L, "httpsc connect poll error, ret = %d", ret);
 				}
 				return 0;
@@ -233,7 +248,7 @@ static int lcheck_connect(lua_State *L) {
 					lua_pushboolean(L, 1);
 					return 1;
 				} else if (ret == -1) {
-					close_fd_t(fd_t);
+					close_fd_t(L, fd_t);
 					return luaL_error(L, "httpsc connect ssl 2 error, errno = %d", errno);
 				}
 				return 0;
@@ -242,58 +257,56 @@ static int lcheck_connect(lua_State *L) {
 			;
 	}
 
-	close_fd_t(fd_t);
+	close_fd_t(L, fd_t);
 	return luaL_error(L, "httpsc connect fator error");
 }
 
 static int lclose(lua_State *L) {
 	cutil_fd_t* fd_t = (cutil_fd_t* ) lua_touserdata(L, 1);
 	if ( fd_t == NULL )
-		return luaL_error(L, "httpsc fd error");
+		return 0;
 	
-	close_fd_t(fd_t);
-
+	close_fd_t(L, fd_t);
 	return 0;
 }
 
-static void block_send(lua_State *L, SSL *ssl, const char * buffer, int sz) {
-	int retry = SEND_RETRY;
-	while(sz > 0) {
-		if (retry <= 0) {
-			luaL_error(L, "httpsc: socket error: retry timeout");
-			return;
-		}
-		retry -= 1;
-		int r = SSL_write(ssl, buffer, sz);
-		if (r < 0) {
-			if (errno == EAGAIN || errno == EINTR)
-				continue;
-			luaL_error(L, "httpsc: socket error: %s", strerror(errno));
-			return;
-		}
-		buffer += r;
-		sz -= r;
-	}
-}
 
 static int lsend(lua_State *L) {
 	cutil_conf_t* cfg = fetch_config(L);
 	if(!cfg->is_init)
 	{
-		luaL_error(L, "httpsc: Not inited");
-		return 0;
+		return luaL_error(L, "httpsc: Not inited");
 	}
 	
-	size_t sz = 0;
 	cutil_fd_t* fd_t = (cutil_fd_t* ) lua_touserdata(L, 1);
 	if ( fd_t == NULL )
 		return luaL_error(L, "httpsc fd error");
+	if ( fd_t->status != CONNECT_DONE )
+		return luaL_error(L, "httpsc fd status error");
 	SSL* ssl = fd_t->ssl;
+	size_t sz = 0;
 	const char * msg = luaL_checklstring(L, 2, &sz);
-
-	block_send(L, ssl, msg, (int)sz);
-
-	return 0;
+	int r = SSL_write(ssl, msg, (int)sz);
+	if (r <= 0) {
+		if (errno == EAGAIN || errno == EINTR) {
+			lua_pushinteger(L, 0);
+			return 1;
+		}
+		int err = errno;
+		int sslerr = SSL_get_error(ssl, r);
+/*
+ *	Possible error: 
+ *	"error:1409F07F:SSL routines:SSL3_WRITE_PENDING: bad write retry" error while attempting an SSL_write?
+ *
+ *	For example, when SSL_write(ssl, ptr, size) with ptr = 0xABCDEFGH, size = 4096 fails with SSL_ERROR_WANT_READ or SSL_ERROR_WANT_WRITE, 
+ *	when retrying the SSL_write call, the parameters ptr and size should be same. It is not equivalent if ptr is another pointer pointing 
+ *	to a copy of the same contents as in the original call.
+ */
+ 		close_fd_t(L, fd_t);
+		return luaL_error(L, "httpsc: socket error: %s (%d), ssl error : %d", strerror(err), err, sslerr);
+	}
+	lua_pushinteger(L, r);
+	return 1;
 }
 
 
@@ -307,6 +320,8 @@ static int lrecv(lua_State *L) {
 	cutil_fd_t* fd_t = (cutil_fd_t* ) lua_touserdata(L, 1);
 	if ( fd_t == NULL )
 		return luaL_error(L, "httpsc fd error");
+	if ( fd_t->status != CONNECT_DONE )
+		return luaL_error(L, "httpsc fd status error");
 	SSL* ssl = fd_t->ssl;
 	int top = lua_gettop(L);
 
@@ -318,16 +333,14 @@ static int lrecv(lua_State *L) {
 	}
 
 	int r = SSL_read(ssl, buffer, size);
-	// if (r == 0) {
-	// 	lua_pushliteral(L, "");
-	// 	/* close */
-	// 	return 1;
-	// }
 	if (r <= 0) {
 		if (errno == EAGAIN || errno == EINTR) {
 			return 0;
 		}
-		return luaL_error(L, "httpsc: socket error: %s", strerror(errno));
+		int err = errno;
+		int sslerr = SSL_get_error(ssl, r);
+		close_fd_t(L, fd_t);
+		return luaL_error(L, "httpsc: socket error: %s (%d), ssl error : %d", strerror(err), err, sslerr);
 	}
 	lua_pushlstring(L, buffer, r);
 	return 1;
@@ -375,6 +388,7 @@ static void _create_config(lua_State *L)
 		OpenSSL_add_all_algorithms();
 		SSL_load_error_strings();
 		ctx = SSL_CTX_new(SSLv23_client_method());
+		SSL_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER );
 		if (ctx == NULL)
 		{
 			ERR_print_errors_fp(stdout);

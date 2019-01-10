@@ -13,6 +13,8 @@ local read_wait = 10       -- 读不到数据时的等待时间(单位0.01秒)�
 
 local requests = {}
 local connections = {}
+local requests_r = {}
+local requests_w = {}
 
 local command = {}
 
@@ -146,8 +148,28 @@ local function recv_data(request)
     end
 end
 
+local function send_data(request)
+    if request.step >= req_step.finish then
+        error("Invalid Step")
+    end
+    local write = function(msg)
+        return httpsc.send(request.fd, msg)
+    end
+
+    local data = request.data
+    local send_len = write(data)
+    if send_len > 0 then
+        if send_len >= #data then
+            request.step = req_step.finish
+            request.data = nil
+            return
+        end
+        request.data = data:sub(send_len + 1)
+    end
+    request.step = req_step.doing
+end
+
 local function finish_request(requests, request, ret, step)
-    pcall(httpsc.close, request.fd)
     if request.co then
         request.ret = ret
         request.step = step
@@ -161,16 +183,21 @@ local function do_timeout()
     while true do
         skynet.sleep(interval)
         local now = os.time()
-        for co, request in pairs(requests) do
+        for co, request in pairs(requests_r) do
             if now - request.time > timeout then
-                finish_request(requests, request, "connect timeout", req_step.error)
+                finish_request(requests_r, request, "recv request timeout", req_step.error)
+            end
+        end
+        for co, request in pairs(requests_w) do
+            if now - request.time > timeout then
+                finish_request(requests_w, request, "send request timeout", req_step.error)
             end
         end
         for co, connection in pairs(connections) do
             if now - connection.time > timeout_connect then
                 connections[co] = nil
-                connection.error = "connecting timeout"
-                pcall(httpsc.close, connection.fd)
+                connection.error = "connect timeout"
+                httpsc.close(connection.fd)
                 skynet.wakeup(co)
             end
         end
@@ -207,12 +234,25 @@ local function do_connect()
     end
 end
 
-local function request(fd, method, host, url, header, content)
-
-    local write = function(msg)
-        httpsc.send(fd, msg)
+local function raw_job(request, requests, job_fun, error_tip, timeout_tip, is_close)
+    local retry_time_s = retry_time_base * 10
+    for k =1, retry_time do
+        local ok, err = pcall(job_fun, request)
+        if not ok then
+            logger.err("https_client recv data fail, err = %s", err)
+            finish_request(requests_w, request, error_tip, req_step.error)
+            return
+        end
+        if request.step >= req_step.finish then
+            finish_request(requests_w, request, request.body, request.step)
+            return
+        end
+        skynet.sleep(retry_time_s)
     end
+    finish_request(requests_w, request, timeout_tip, req_step.error)
+end
 
+local function raw_write(fd, method, host, url, header, content)
     local header_content = ""
     if header then
         if not header.host then
@@ -225,13 +265,28 @@ local function request(fd, method, host, url, header, content)
         header_content = string.format("host:%s\r\n",host)
     end
 
+    local request_header
     if content then
-        local data = string.format("%s %s HTTP/1.1\r\n%scontent-length:%d\r\n\r\n%s", method, url, header_content, #content, content)
-        write(data)
+        request_header = string.format("%s %s HTTP/1.1\r\n%scontent-length:%d\r\n\r\n%s", method, url, header_content, #content, content)
     else
-        local request_header = string.format("%s %s HTTP/1.1\r\n%scontent-length:0\r\n\r\n", method, url, header_content)
-        write(request_header)
+        request_header = string.format("%s %s HTTP/1.1\r\n%scontent-length:0\r\n\r\n", method, url, header_content)
     end
+
+    local self_co = coroutine.running()
+
+    local request = {
+        step = req_step.start,
+        co = self_co,
+        time = os.time(),
+        fd = fd,
+        data = request_header,
+    }
+    requests_w[self_co] = request
+    skynet.fork(raw_job, request, requests_w, send_data, "send_data error", "send_data timeout")
+    skynet.wait()
+    request.co = nil
+    request.fd = nil
+    request.data = nil
 
     return true
 end
@@ -277,40 +332,52 @@ local function raw_request(method, host, url, header, content)
     connections[self_co] = connection
     skynet.wait()
     if connection.error then
+        httpsc.close(fd)
         return false, connection.error
     end
 
-    --perform request
-    local ok = xpcall(request, handle_err, fd, method, host, url, header, content)
-    if not ok then
-        pcall(httpsc.close, fd)
-        return false
+    local header_content = ""
+    if header then
+        if not header.host then
+            header.host = host
+        end
+        for k,v in pairs(header) do
+            header_content = string.format("%s%s:%s\r\n", header_content, k, v)
+        end
+    else
+        header_content = string.format("host:%s\r\n",host)
+    end
+
+    local request_header
+    if content then
+        request_header = string.format("%s %s HTTP/1.1\r\n%scontent-length:%d\r\n\r\n%s", method, url, header_content, #content, content)
+    else
+        request_header = string.format("%s %s HTTP/1.1\r\n%scontent-length:0\r\n\r\n", method, url, header_content)
+    end
+    local request = {
+        step = req_step.start,
+        co = self_co,
+        time = os.time(),
+        fd = fd,
+        data = request_header,
+    }
+    requests_w[self_co] = request
+    skynet.fork(raw_job, request, requests_w, send_data, "send_data error", "send_data timeout")
+    skynet.wait()
+    request.co = nil
+    request.fd = nil
+    request.data = nil
+    if request.step ~= req_step.finish then
+        httpsc.close(fd)
+        return false, request.error
     end
     
     return true, fd
 end
 
-local function raw_read(request)
-    local retry_time_s = retry_time_base * 10
-    for k =1, retry_time do
-        local ok, err = pcall(recv_data, request)
-        if not ok then
-            logger.err("https_client recv data fail, err = %s", err)
-            finish_request(requests, request, "recv_data error", req_step.error)
-            return
-        end
-        if request.step >= req_step.finish then
-            finish_request(requests, request, request.body, request.step)
-            return
-        end
-        skynet.sleep(retry_time_s)
-    end
-    finish_request(requests, request, "recv_data timeout", req_step.error)
-end
-
 --- 请求某个url
--- @treturn bool 请求是否成功
--- @treturn string 当成功时，返回内容，当失败时，返回出错原因 
+-- @return bool 请求是否成功
+-- @return string 当成功时，返回内容，当失败时，返回出错原因 
 function command.request(method, host, url, header, content)
     local ok, is_ok, fd = xpcall(raw_request, handle_err, method, host, url, header, content)
     if not ok then
@@ -323,19 +390,19 @@ function command.request(method, host, url, header, content)
     end
 
     local self_co = coroutine.running()
-
     local request = {
         step = req_step.start,
         co = self_co,
         time = os.time(),
         fd = fd,
     }
-    requests[self_co] = request
-    skynet.fork(raw_read, request)
+    requests_r[self_co] = request
+    skynet.fork(raw_job, request, requests_r, recv_data, "recv_data error", "recv_data timeout")
     skynet.wait()
     request.co = nil
     request.fd = nil
 
+    httpsc.close(fd)
     if request.step ~= req_step.finish then
         logger.err("https_client request timeout, host = %s, url = %s, err = %s", host, url, request.ret)
         return false, request.ret or "request timeout"
