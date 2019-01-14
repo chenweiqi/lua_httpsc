@@ -11,7 +11,6 @@ local timeout_connect = 3  -- 创建连接超时(单位1秒)
 local read_wait = 10       -- 读不到数据时的等待时间(单位0.01秒)，让出调度权
 
 
-local requests = {}
 local connections = {}
 local requests_r = {}
 local requests_w = {}
@@ -240,16 +239,16 @@ local function raw_job(request, requests, job_fun, error_tip, timeout_tip, is_cl
         local ok, err = pcall(job_fun, request)
         if not ok then
             logger.err("https_client recv data fail, err = %s", err)
-            finish_request(requests_w, request, error_tip, req_step.error)
+            finish_request(requests, request, error_tip, req_step.error)
             return
         end
         if request.step >= req_step.finish then
-            finish_request(requests_w, request, request.body, request.step)
+            finish_request(requests, request, request.body, request.step)
             return
         end
         skynet.sleep(retry_time_s)
     end
-    finish_request(requests_w, request, timeout_tip, req_step.error)
+    finish_request(requests, request, timeout_tip, req_step.error)
 end
 
 local function raw_write(fd, method, host, url, header, content)
