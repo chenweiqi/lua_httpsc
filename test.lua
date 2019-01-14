@@ -11,16 +11,26 @@ end
 
 -- print(fd)
 
+local function read(sz)
+	return httpsc.recv(fd, sz) or ""
+end
+	
+local function write(msg)
+	while true do
+		local send_len = httpsc.send(fd, msg)
+		if send_len > 0 then
+			if send_len >= #msg then
+				break
+			end
+			msg = msg:sub(send_len+1)
+		else
+			httpsc.usleep(1000)
+		end
+	end
+
+end
+
 function request(method, host, url, recvheader, header, content)
-	local read = function()
-		return httpsc.recv(fd) or ""
-	end
-
-	local write = function(msg)
-		return httpsc.send(fd, msg)
-	end
-
-
 	local header_content = ""
 	if header then
 		if not header.host then
@@ -41,20 +51,8 @@ function request(method, host, url, recvheader, header, content)
 	end
 	-- print(#data)
 	-- print(data)
-
-	while true do
-		local send_len = write(data)
-		if send_len > 0 then
-			if send_len >= #data then
-				break
-			end
-			data = data:sub(send_len+1)
-		else
-			httpsc.usleep(1000)
-		end
-	end
-
-	httpsc.usleep(1000000)
+	write(data)
+	--httpsc.usleep(1000000)
 	local tmpline = {}
 	local body = internal.recvheader(read, tmpline, "")
 	if not body then
@@ -117,6 +115,7 @@ local code, body = request("GET", "www.baidu.com", "/", nil, {}, nil)
 
 print(body)
 
+-- Actually, it's useless. Because close is auto executed by LUA GC
 httpsc.close(fd)
 
 print("ok!")

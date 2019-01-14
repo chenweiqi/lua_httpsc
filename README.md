@@ -22,7 +22,7 @@ end
 ```
 ### Write data to remote
 ```lua
--- It is still synchronous and will be optimized in the future
+-- It is asynchronous now
 httpsc.send(fd, msg)
 ```
 
@@ -33,6 +33,7 @@ httpsc.recv(fd)
 
 ### Close Connection
 ```lua
+-- Actually, it's useless. Because close is auto executed by LUA GC
 httpsc.close(fd)
 ```
 

@@ -30,7 +30,7 @@ OBJS =              lua_httpsc.o
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(LDFLAGS) $(CUTIL_LDFLAGS) -Iinclude -Wl,--whole-archive ./*.a -Wl,--no-whole-archive -o $@ $(OBJS) -lrt ./libcrypto.a ./libssl.a  ./libidn.a ./libz.a
+	$(CC) $(LDFLAGS) $(CUTIL_LDFLAGS) -Iinclude -Wl,--whole-archive ./lib/*.a -Wl,--no-whole-archive -o $@ $(OBJS) -lrt ./lib/libcrypto.a ./lib/libssl.a  ./lib/libidn.a ./lib/libz.a
 
 install: $(TARGET)
 	mkdir -p $(DESTDIR)$(LUA_CMODULE_DIR)
