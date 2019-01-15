@@ -233,22 +233,25 @@ local function do_connect()
     end
 end
 
-local function raw_job(request, requests, job_fun, error_tip, timeout_tip, is_close)
+local function raw_job(request, requests, job_fun, error_tip, timeout_tip)
     local retry_time_s = retry_time_base * 10
+    local ret_text = timeout_tip
+    local ret_step = req_step.error
     for k =1, retry_time do
         local ok, err = pcall(job_fun, request)
         if not ok then
             logger.err("https_client recv data fail, err = %s", err)
-            finish_request(requests, request, error_tip, req_step.error)
-            return
+            ret_text = error_tip
+            break
         end
         if request.step >= req_step.finish then
-            finish_request(requests, request, request.body, request.step)
-            return
+            ret_text = request.body
+            ret_step = request.step
+            break
         end
         skynet.sleep(retry_time_s)
     end
-    finish_request(requests, request, timeout_tip, req_step.error)
+    finish_request(requests, request, ret_text, ret_step)
 end
 
 local function raw_write(fd, method, host, url, header, content)
