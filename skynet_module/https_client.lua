@@ -240,7 +240,7 @@ local function raw_job(request, requests, job_fun, error_tip, timeout_tip)
     for k =1, retry_time do
         local ok, err = pcall(job_fun, request)
         if not ok then
-            logger.err("https_client recv data fail, err = %s", err)
+            logger.err("https_client %s, err = %s", error_tip, err)
             ret_text = error_tip
             break
         end
@@ -252,45 +252,6 @@ local function raw_job(request, requests, job_fun, error_tip, timeout_tip)
         skynet.sleep(retry_time_s)
     end
     finish_request(requests, request, ret_text, ret_step)
-end
-
-local function raw_write(fd, method, host, url, header, content)
-    local header_content = ""
-    if header then
-        if not header.host then
-            header.host = host
-        end
-        for k,v in pairs(header) do
-            header_content = string.format("%s%s:%s\r\n", header_content, k, v)
-        end
-    else
-        header_content = string.format("host:%s\r\n",host)
-    end
-
-    local request_header
-    if content then
-        request_header = string.format("%s %s HTTP/1.1\r\n%scontent-length:%d\r\n\r\n%s", method, url, header_content, #content, content)
-    else
-        request_header = string.format("%s %s HTTP/1.1\r\n%scontent-length:0\r\n\r\n", method, url, header_content)
-    end
-
-    local self_co = coroutine.running()
-
-    local request = {
-        step = req_step.start,
-        co = self_co,
-        time = os.time(),
-        fd = fd,
-        data = request_header,
-    }
-    requests_w[self_co] = request
-    skynet.fork(raw_job, request, requests_w, send_data, "send_data error", "send_data timeout")
-    skynet.wait()
-    request.co = nil
-    request.fd = nil
-    request.data = nil
-
-    return true
 end
 
 
