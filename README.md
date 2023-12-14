@@ -40,5 +40,3 @@ httpsc.close(fd)
 ## Example
 See test.lua
 
-## Defect
-Only single-threaded support now
