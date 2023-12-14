@@ -1,6 +1,6 @@
-/* Lua HTTPSC - a HTTPS library for Lua
+/* Lua httpsc: - a HTTPS library for Lua
  *
- * Copyright (c) 2016  chenweiqi
+ * Copyright (c) 2016    chenweiqi
  *
  * The MIT License (MIT)
  * Permission is hereby granted, free of charge, to any person obtaining
@@ -45,364 +45,383 @@
 #define ERROR_FD -1
 #define SEND_RETRY 10
 
-static SSL_CTX *ctx = NULL;
+static int openssl_init = !!NULL;
 
 typedef struct {
-	int is_init;
+    int is_init;
+    int ssl_init;
+    SSL_CTX *ctx;
 } cutil_conf_t;
 
 enum cutil_conn_st
 {
-	CONNECT_INIT = 1,
-	CONNECT_PORT = 2,
-	CONNECT_SSL = 3,
-	CONNECT_DONE = 4
+    CONNECT_INIT = 1,
+    CONNECT_PORT = 2,
+    CONNECT_SSL = 3,
+    CONNECT_DONE = 4
 };
 
 typedef struct {
-	int fd;
-	SSL* ssl;
-	enum cutil_conn_st status;
+    int fd;
+    SSL* ssl;
+    enum cutil_conn_st status;
 } cutil_fd_t;
 
 static cutil_conf_t* fetch_config(lua_State *L) {
-	cutil_conf_t* cfg;
-	cfg = lua_touserdata(L, lua_upvalueindex(1));
-	if (!cfg)
-		luaL_error(L, "httpsc: Unable to fetch cfg");
+    cutil_conf_t* cfg;
+    cfg = lua_touserdata(L, lua_upvalueindex(1));
+    if (!cfg) {
+        luaL_error(L, "httpsc: unable to fetch cfg");
+        return NULL;
+    }
 
-	return cfg;
+    if (!cfg->is_init) {
+        luaL_error(L, "httpsc: not inited");
+        return NULL;
+    }
+
+    if (!cfg->ssl_init) {
+        if (!openssl_init) {
+            openssl_init = !NULL;
+            SSL_library_init();
+            OpenSSL_add_all_algorithms();
+            SSL_load_error_strings();
+        }
+        cfg->ssl_init = !NULL;
+    }
+
+    if (!cfg->ctx) {
+        cfg->ctx = SSL_CTX_new(SSLv23_client_method());
+        if (!cfg->ctx) {
+            char buf[256];
+            unsigned long err = ERR_get_error();
+            ERR_error_string_n(err, buf, sizeof(buf));
+            luaL_error(L, "httpsc: unable to new ssl_ctx %s", buf);
+            return NULL;
+        }
+    }
+
+    return cfg;
 }
 
 static int _gc_fd(lua_State *L) {
-	cutil_fd_t* fd_t = lua_touserdata(L, 1);
+    cutil_fd_t* fd_t = lua_touserdata(L, 1);
+    SSL* ssl = fd_t->ssl;
+    if (ssl) {
+        fd_t->ssl = NULL;
+        /*
+         *    Possible error: 
+         *    "error:140E0197:SSL routines:SSL_shutdown:shutdown while in init"
+         *     error while attempting an SSL_shutdown?
+         *
+         *    OpenSSL 1.0.2f complains if SSL_shutdown() is called during
+         *    an SSL handshake, while previous versions always return 0.
+         *    Avoid calling SSL_shutdown() if handshake wasn't completed.
+         */
+        if (!SSL_in_init(ssl))
+            SSL_shutdown(ssl);
+        SSL_free(ssl);
+    }
 
-	enum cutil_conn_st status = fd_t->status;
-	SSL* ssl = fd_t->ssl;
-	if ( ssl != NULL ) {
-		fd_t->ssl = NULL;
-/*
- *	Possible error: 
- *	"error:140E0197:SSL routines:SSL_shutdown:shutdown while in init" error while attempting an SSL_shutdown?
- *
- *	OpenSSL 1.0.2f complains if SSL_shutdown() is called during an SSL handshake, while previous versions always return 0.
- *	Avoid calling SSL_shutdown() if handshake wasn't completed.
- */
-		if ( status == CONNECT_DONE )
-			SSL_shutdown(ssl);
-		if ( status == CONNECT_SSL || status == CONNECT_DONE )
-			SSL_free(ssl);
-	}
-
-	int fd = fd_t->fd;
-	if (fd != ERROR_FD) {
-		fd_t->fd = ERROR_FD;
-		close(fd);
-	}
-	return 0;
+    int fd = fd_t->fd;
+    if (fd != ERROR_FD) {
+        fd_t->fd = ERROR_FD;
+        close(fd);
+    }
+    return 0;
 }
 
 static int _connect_ssl(lua_State *L, SSL* ssl) {
-	int ret = SSL_connect(ssl);
-	if (ret == 1) {
-		SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-		return 0;
-	}
-	int err = errno;
-	int sslerr = SSL_get_error(ssl, ret);
-	if (sslerr != SSL_ERROR_WANT_WRITE && sslerr != SSL_ERROR_WANT_READ ) {
-		luaL_error(L, "httpsc connect ssl error: %s (%d), ssl_error: %d", strerror(err), err, sslerr);
-		return -1;
-	}
-	return 1;
+    int ret = SSL_connect(ssl);
+    if (ret == 1) {
+        SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        return 0;
+    }
+    int err = errno;
+    int sslerr = SSL_get_error(ssl, ret);
+    ERR_clear_error();
+    if (sslerr != SSL_ERROR_WANT_WRITE && sslerr != SSL_ERROR_WANT_READ ) {
+        luaL_error(L, "httpsc: connect error: %s (%d), ssl_error: %d", strerror(err), err, sslerr);
+        return -1;
+    }
+    return 1;
 }
 
 static int lconnect(lua_State *L) {
-	cutil_conf_t* cfg = fetch_config(L);
-	if(!cfg->is_init)
-	{
-		luaL_error(L, "httpsc: Not inited");
-		return 0;
-	}
-	
-	const char * addr = luaL_checkstring(L, 1);
-	int port = luaL_checkinteger(L, 2);
+    cutil_conf_t* cfg = fetch_config(L);
+    if (!cfg) return 0;
+    
+    const char * addr = luaL_checkstring(L, 1);
+    int port = luaL_checkinteger(L, 2);
 
-	cutil_fd_t* fd_t = lua_newuserdata(L, sizeof(cutil_fd_t));
-	if ( fd_t == NULL )
-		return luaL_error(L, "httpsc: Create fd %s %d failed", addr, port);
-	fd_t->fd = ERROR_FD;
-	fd_t->ssl = NULL;
-	fd_t->status = CONNECT_INIT;
+    cutil_fd_t* fd_t = lua_newuserdata(L, sizeof(cutil_fd_t));
+    if (!fd_t) {
+        luaL_error(L, "httpsc: create fd %s %d failed", addr, port);
+        return 0;
+    }
+    fd_t->fd = ERROR_FD;
+    fd_t->ssl = NULL;
+    fd_t->status = CONNECT_INIT;
 
-	if (luaL_newmetatable(L, "https_socket")) {
-		lua_pushcfunction(L, _gc_fd);
-		lua_setfield(L, -2, "__gc");
-	}
-	lua_setmetatable(L, -2);
+    if (luaL_newmetatable(L, "https_socket")) {
+        lua_pushcfunction(L, _gc_fd);
+        lua_setfield(L, -2, "__gc");
+    }
+    lua_setmetatable(L, -2);
 
-	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	struct sockaddr_in my_addr;
-	fd_t->fd = fd;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in my_addr;
+    fd_t->fd = fd;
 
-	bzero(&my_addr, sizeof(my_addr));
-	my_addr.sin_addr.s_addr = inet_addr(addr);
-	my_addr.sin_family = AF_INET;
-	my_addr.sin_port = htons(port);
+    bzero(&my_addr, sizeof(my_addr));
+    my_addr.sin_addr.s_addr = inet_addr(addr);
+    my_addr.sin_family = AF_INET;
+    my_addr.sin_port = htons(port);
 
-	int ret;
-	struct timeval timeo = {3, 0};
-	socklen_t len = sizeof(timeo);
-	ret = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeo, len);
-	if (ret) {
-		return luaL_error(L, "httpsc: Setsockopt %s %d failed", addr, port);
-	}
+    int ret;
+    struct timeval timeo = {3, 0};
+    socklen_t len = sizeof(timeo);
+    ret = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeo, len);
+    if (ret) {
+        luaL_error(L, "httpsc: setsockopt %s %d failed", addr, port);
+        return 0;
+    }
 
-	int flag = fcntl(fd, F_GETFL, 0);
-	fcntl(fd, F_SETFL, flag | O_NONBLOCK);
+    int flag = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flag | O_NONBLOCK);
 
-	ret = connect(fd, (struct sockaddr *)&my_addr, sizeof(struct sockaddr_in));
-	if (ret != 0) {
-		if (errno == EINPROGRESS) {
-			fd_t->status = CONNECT_PORT;
-		} else {
-			return luaL_error(L, "httpsc: Connect %s %d failed", addr, port);
-		}
+    ret = connect(fd, (struct sockaddr *)&my_addr, sizeof(struct sockaddr_in));
+    if (ret != 0) {
+        if (errno != EINPROGRESS) {
+            luaL_error(L, "httpsc: connect %s %d failed", addr, port);
+            return 0;
+        }
+        fd_t->status = CONNECT_PORT;
+    }
 
-	} else {
-		SSL *ssl = SSL_new(ctx);
-		if ( ssl == NULL ) {
-			return luaL_error(L, "httpsc ssl_new error, errno = %d", errno);
-		}
-		fd_t->ssl = ssl;
-		fd_t->status = CONNECT_SSL;
-		SSL_set_fd(ssl, fd);
-		ret = _connect_ssl(L, ssl);
-		if (ret == 0) {
-			fd_t->status = CONNECT_DONE;
-		}
-	}
-	
-	return 1;
+    SSL *ssl = SSL_new(cfg->ctx);
+    if (!ssl) {
+        luaL_error(L, "httpsc: ssl_new error, errno = %d", errno);
+        return 0;
+    }
+    fd_t->ssl = ssl;
+    fd_t->status = CONNECT_SSL;
+    SSL_set_fd(ssl, fd);
+    ret = _connect_ssl(L, ssl);
+    if (ret == 0)
+        fd_t->status = CONNECT_DONE;
+    return 1;
 }
 
 static int lcheck_connect(lua_State *L) {
-	cutil_fd_t* fd_t = (cutil_fd_t* ) lua_touserdata(L, 1);
-	if ( fd_t == NULL )
-		return luaL_error(L, "httpsc fd error");
+    cutil_conf_t* cfg = fetch_config(L);
+    if (!cfg) return 0;
+    cutil_fd_t* fd_t = (cutil_fd_t* ) lua_touserdata(L, 1);
+    if (!fd_t) {
+        luaL_error(L, "httpsc: fd error");
+        return 0;
+    }
+    if (fd_t->status == CONNECT_PORT) {
+        struct pollfd fds;
+        int ret, err;
+        fds.fd = fd_t->fd;
+        fds.events = POLLIN | POLLOUT;
+        /* get status immediately */
+        ret = poll(&fds, 1, 0);
+        if (ret == -1) {
+            luaL_error(L, "httpsc: connect poll error, ret = %d", ret);
+            return 0;
+        }
+        socklen_t len = sizeof(int);
+        ret = getsockopt(fd_t->fd, SOL_SOCKET, SO_ERROR, &err, &len);
+        if (ret < 0) {
+            luaL_error(L, "httpsc: getsockopt error, ret = %d", ret);
+            return 0;
+        }
+        if (err != 0) {
+            if (errno != EAGAIN && errno != EINTR && errno != EINPROGRESS ) {
+                luaL_error(L, "httpsc: connect sockopt error, errno = %d", errno);
+            }
+            return 0;
+        }
+        SSL *ssl = SSL_new(cfg->ctx);
+        if (!ssl) {
+            luaL_error(L, "httpsc: ssl_new error, errno = %d", errno);
+            return 0;
+        }
+        fd_t->ssl = ssl;
+        fd_t->status = CONNECT_SSL;
+        SSL_set_fd(ssl, fd_t->fd);
+    }
 
-	switch (fd_t->status) {
-		case CONNECT_DONE:
-			lua_pushboolean(L, 1);
-			return 1;
-		case CONNECT_PORT: 
-			{
-				struct pollfd fds;
-				int ret, err;
-				fds.fd = fd_t->fd;
-				fds.events = POLLIN | POLLOUT;
-				/* get status immediately */
-				ret = poll(&fds, 1, 0);
-				if (ret != -1) {
-					socklen_t len = sizeof(int);
-					ret = getsockopt(fd_t->fd, SOL_SOCKET, SO_ERROR, &err, &len);
-					if (ret < 0) {
-						return luaL_error(L, "httpsc getsockopt error, ret = %d", ret);
-					}
-					if (err == 0) {
-						SSL *ssl = SSL_new(ctx);
-						if ( ssl == NULL ) {
-							return luaL_error(L, "httpsc ssl_new error, errno = %d", errno);
-						}
-						fd_t->ssl = ssl;
-						fd_t->status = CONNECT_SSL;
-						SSL_set_fd(ssl, fd_t->fd);
-						ret = _connect_ssl(L, ssl);
-						if (ret == 0) {
-							fd_t->status = CONNECT_DONE;
-							lua_pushboolean(L, 1);
-							return 1;
-						}
-					} else {
-						if (errno == EAGAIN || errno == EINTR || errno == EINPROGRESS ) {
-							return 0;
-						} else {
-							return luaL_error(L, "httpsc connect sockopt error, errno = %d", errno);
-						}
-					}
-				} else {
-					return luaL_error(L, "httpsc connect poll error, ret = %d", ret);
-				}
-				return 0;
-			}
-		case CONNECT_SSL:
-			{
-				int ret = _connect_ssl(L, fd_t->ssl);
-				if (ret == 0) {
-					fd_t->status = CONNECT_DONE;
-					lua_pushboolean(L, 1);
-					return 1;
-				}
-				return 0;
-			}
-		default:
-			;
-	}
+    if (fd_t->status == CONNECT_SSL) {
+        int ret = _connect_ssl(L, fd_t->ssl);
+        if (ret != 0)
+            return 0;
+        fd_t->status = CONNECT_DONE;
+    }
 
-	return luaL_error(L, "httpsc connect fator error");
+    if (fd_t->status == CONNECT_DONE) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
+    luaL_error(L, "httpsc: not collction");
+    return 0;
 }
 
-static int lclose(lua_State *L) {
-	cutil_fd_t* fd_t = (cutil_fd_t* ) lua_touserdata(L, 1);
-	if ( fd_t == NULL )
-		return 0;
-	
-	return 0;
+static int luseless(lua_State *L) {
+    return 0;
 }
 
 
 static int lsend(lua_State *L) {
-	cutil_conf_t* cfg = fetch_config(L);
-	if(!cfg->is_init)
-	{
-		return luaL_error(L, "httpsc: Not inited");
-	}
-	
-	cutil_fd_t* fd_t = (cutil_fd_t* ) lua_touserdata(L, 1);
-	if ( fd_t == NULL )
-		return luaL_error(L, "httpsc fd error");
-	SSL* ssl = fd_t->ssl;
-	if (SSL_in_init(ssl)) {
-		lua_pushinteger(L, 0);
-		return 1;
-	}
-	if ( fd_t->status != CONNECT_DONE )
-		return luaL_error(L, "httpsc fd status error");
-	size_t sz = 0;
-	const char * msg = luaL_checklstring(L, 2, &sz);
-	int r = SSL_write(ssl, msg, (int)sz);
-	if (r <= 0) {
-		if (errno == EAGAIN || errno == EINTR) {
-			lua_pushinteger(L, 0);
-			return 1;
-		}
-		int err = errno;
-		int sslerr = SSL_get_error(ssl, r);
-/*
- *	Possible error: 
- *	"error:1409F07F:SSL routines:SSL3_WRITE_PENDING: bad write retry" error while attempting an SSL_write?
- *
- *	For example, when SSL_write(ssl, ptr, size) with ptr = 0xABCDEFGH, size = 4096 fails with SSL_ERROR_WANT_READ or SSL_ERROR_WANT_WRITE, 
- *	when retrying the SSL_write call, the parameters ptr and size should be same. It is not equivalent if ptr is another pointer pointing 
- *	to a copy of the same contents as in the original call.
- */
-		return luaL_error(L, "httpsc: socket send error: %s (%d), ssl_error : %d", strerror(err), err, sslerr);
-	}
-	lua_pushinteger(L, r);
-	return 1;
+    cutil_conf_t* cfg = fetch_config(L);
+    if (!cfg) return 0;
+    
+    cutil_fd_t* fd_t = (cutil_fd_t* ) lua_touserdata(L, 1);
+    if ( fd_t == NULL ) {
+        luaL_error(L, "httpsc: fd error");
+        return 0;
+    }
+    SSL* ssl = fd_t->ssl;
+    if (SSL_in_init(ssl)) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+    if (fd_t->status != CONNECT_DONE) {
+        luaL_error(L, "httpsc: fd status error");
+        return 0;
+    }
+    size_t sz = 0;
+    const char * msg = luaL_checklstring(L, 2, &sz);
+    int r = SSL_write(ssl, msg, (int)sz);
+    if (r > 0) {
+        lua_pushinteger(L, r);
+        return 1;
+    }
+    if (errno == EAGAIN || errno == EINTR) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+    int err = errno;
+    int sslerr = SSL_get_error(ssl, r);
+    ERR_clear_error();
+    /*
+     *    Possible error: 
+     *    "error:1409F07F:SSL routines:SSL3_WRITE_PENDING: bad write retry" error
+     *     while attempting an SSL_write?
+     *
+     *    For example, when SSL_write(ssl, ptr, size) with ptr = 0xABCDEFGH, 
+     *    size = 4096 fails with SSL_ERROR_WANT_READ or SSL_ERROR_WANT_WRITE, 
+     *    when retrying the SSL_write call, the parameters ptr and size should
+     *    be same. It is not equivalent if ptr is another pointer pointing 
+     *    to a copy of the same contents as in the original call.
+     */
+    luaL_error(L, "httpsc: send error: %s (%d), ssl_error : %d", strerror(err), err, sslerr);
+    return 0;
 }
 
 
 static int lrecv(lua_State *L) {
-	cutil_conf_t* cfg = fetch_config(L);
-	if(!cfg->is_init)
-	{
-		luaL_error(L, "httpsc: Not inited");
-		return 0;
-	}
-	cutil_fd_t* fd_t = (cutil_fd_t* ) lua_touserdata(L, 1);
-	if ( fd_t == NULL )
-		return luaL_error(L, "httpsc fd error");
-	SSL* ssl = fd_t->ssl;
-	if (SSL_in_init(ssl)) {
-		return 0;
-	}
-	if ( fd_t->status != CONNECT_DONE )
-		return luaL_error(L, "httpsc fd status error");
-	int top = lua_gettop(L);
+    cutil_conf_t* cfg = fetch_config(L);
+    if (!cfg) return 0;
 
-	char buffer[CACHE_SIZE];
-	int size = CACHE_SIZE;
-	if ( top > 1 && lua_isnumber(L, 2)) {
-		int _size = lua_tointeger(L, 2);
-		size = _size > size ? size : _size;
-	}
+    cutil_fd_t* fd_t = (cutil_fd_t* ) lua_touserdata(L, 1);
+    if ( fd_t == NULL )
+        return luaL_error(L, "httpsc: fd error");
+    SSL* ssl = fd_t->ssl;
+    if (SSL_in_init(ssl)) {
+        return 0;
+    }
+    if ( fd_t->status != CONNECT_DONE )
+        return luaL_error(L, "httpsc: fd status error");
+    int top = lua_gettop(L);
 
-	int r = SSL_read(ssl, buffer, size);
-	if (r <= 0) {
-		if (errno == EAGAIN || errno == EINTR) {
-			return 0;
-		}
-		int err = errno;
-		int sslerr = SSL_get_error(ssl, r);
-		return luaL_error(L, "httpsc: socket recv error: %s (%d), ssl_error : %d", strerror(err), err, sslerr);
-	}
-	lua_pushlstring(L, buffer, r);
-	return 1;
+    char buffer[CACHE_SIZE];
+    int size = CACHE_SIZE;
+    if ( top > 1 && lua_isnumber(L, 2)) {
+        int _size = lua_tointeger(L, 2);
+        size = _size > size ? size : _size;
+    }
+
+    int r = SSL_read(ssl, buffer, size);
+    if (r > 0) {
+        lua_pushlstring(L, buffer, r);
+        return 1;
+    }
+    if (errno == EAGAIN || errno == EINTR) {
+        return 0;
+    }
+    int err = errno;
+    int sslerr = SSL_get_error(ssl, r);
+    ERR_clear_error();
+    luaL_error(L, "httpsc: recv error: %s (%d), ssl_error : %d", strerror(err), err, sslerr);
+    return 0;
 }
 
 
 static int lusleep(lua_State *L) {
-	int n = luaL_checknumber(L, 1);
-	usleep(n);
-	return 0;
+    int n = luaL_checknumber(L, 1);
+    usleep(n);
+    return 0;
 }
 
 
-/* GC, clean up the buf */
-static int _gc(lua_State *L)
-{
-	if (ctx != NULL){
-		SSL_CTX_free(ctx);
-		ctx = NULL;
-	}
-	return 0;
+/* GC, clean up the ctx */
+static int _gc(lua_State *L) {
+    cutil_conf_t* cfg = lua_touserdata(L, 1);
+    SSL_CTX *ctx;
+    if (cfg && (ctx = cfg->ctx)) {
+        cfg->ctx = NULL;
+        SSL_CTX_free(ctx);
+    }
+    return 0;
 }
 
-static void _create_config(lua_State *L)
-{
-	cutil_conf_t *cfg;
-	cfg = lua_newuserdata(L, sizeof(*cfg));
-	cfg->is_init = !!NULL;
-	/* Create GC method to clean up buf */
-	lua_newtable(L);
-	lua_pushcfunction(L, _gc);
-	lua_setfield(L, -2, "__gc");
-	lua_setmetatable(L, -2);
-
-	/* openssl init */
-	if ( ctx == NULL) {
-		SSL_library_init();
-		OpenSSL_add_all_algorithms();
-		SSL_load_error_strings();
-		ctx = SSL_CTX_new(SSLv23_client_method());
-		if (ctx == NULL)
-		{
-			ERR_print_errors_fp(stdout);
-			luaL_error(L, "httpsc: Unable to init openssl");
-			return;
-		}
-	}
-
-	cfg->is_init = !NULL;
+static void _create_config(lua_State *L) {
+    cutil_conf_t *cfg;
+    cfg = lua_newuserdata(L, sizeof(*cfg));
+    cfg->is_init = !!NULL;
+    cfg->ssl_init = !!NULL;
+    cfg->ctx = NULL;
+    /* Create GC to clean up ctx */
+    lua_newtable(L);
+    lua_pushcfunction(L, _gc);
+    lua_setfield(L, -2, "__gc");
+    lua_setmetatable(L, -2);
+    cfg->is_init = !NULL;
 }
 
+static int lpreload(lua_State *L) {
+    cutil_conf_t* cfg = fetch_config(L);
+    if (!cfg) {
+        return 0;
+    }
+    /* if init openssl lib */
+    int init_lib = lua_toboolean(L, 1);
+    if (!init_lib) {
+        cfg->ssl_init = !NULL;
+    }
+    return 0;
+}
 
-int luaopen_httpsc(lua_State *L)
-{
-	static const luaL_Reg funcs[] = {
-		{ "connect", lconnect },
-		{ "check_connect", lcheck_connect },
-		{ "recv", lrecv },
-		{ "send", lsend },
-		{ "close", lclose },
-		{ "usleep", lusleep },
-		{NULL, NULL}
-	};
+int luaopen_httpsc(lua_State *L) {
+    static const luaL_Reg funcs[] = {
+        { "connect", lconnect },
+        { "check_connect", lcheck_connect },
+        { "recv", lrecv },
+        { "send", lsend },
+        { "preload", lpreload },
+        { "usleep", lusleep },
+        /* useless */
+        { "close", luseless },
+        {NULL, NULL}
+    };
 
-	lua_newtable(L);
-	_create_config(L);
-	luaL_setfuncs(L, funcs, 1);
+    lua_newtable(L);
+    _create_config(L);
+    luaL_setfuncs(L, funcs, 1);
 
-	return 1;
+    return 1;
 }
