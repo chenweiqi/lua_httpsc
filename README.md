@@ -1,10 +1,10 @@
 # lua_httpsc
-An asynchronous https library for lua
+An asynchronous https client library for lua
 
 
 ## API
 ```lua
-local httpsc = require "httpsc"
+httpsc = require "httpsc"
 ```
 
 ### Connect remote https server
@@ -12,7 +12,11 @@ local httpsc = require "httpsc"
 local ip = "127.0.0.1"
 local port = 443
 
-local fd = httpsc.connect(ip, port)
+fd = httpsc.connect(ip, port)
+```
+
+### Check connection is ready, only for async
+```lua
 -- Check connection
 while true do
 	local ok = httpsc.check_connect(fd)
@@ -20,21 +24,26 @@ while true do
 	httpsc.usleep(10000)
 end
 ```
+
 ### Write data to remote
 ```lua
--- It is asynchronous now
 httpsc.send(fd, msg)
 ```
 
 ### Receive data from remote
 ```lua
-httpsc.recv(fd)
+httpsc.recv(fd, size)       -- size is optional
 ```
 
-### Close Connection
+
+### Set configure
 ```lua
--- Actually, it's useless. Because close is auto executed by LUA GC
-httpsc.close(fd)
+httpsc.set_conf({
+	init_lib = true, 		-- load openssl libary, default: true
+	async = true,			-- work under non-blocking, default: true
+	send_timeout = 3000,	-- socket send timeout, default: 3000 (3 second)
+	recv_timeout = 3000,	-- socket recv timeout, default: 3000 (3 second)
+})
 ```
 
 ## Example

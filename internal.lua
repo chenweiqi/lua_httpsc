@@ -185,7 +185,7 @@ function M.request(httpsc, fd)
 		local tmpline = {}
 		local body = M.recvheader(read, tmpline, "")
 		if not body then
-			error(socket.socket_error)
+			error("socket_error")
 		end
 
 		local statusline = tmpline[1]
