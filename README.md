@@ -1,5 +1,5 @@
 # lua_httpsc
-An asynchronous https client library for lua
+A non-blocking https client library for lua, it also support blocking request, http request
 
 
 ## API
@@ -13,7 +13,10 @@ local ip = "127.0.0.1"
 local port = 443
 
 fd = httpsc.connect(ip, port)
+-- fd = httpsc.connect(ip, port, "http")
+-- fd = httpsc.connect(ip, port, "https")
 ```
+
 
 ### Check connection is ready, only for async
 ```lua
@@ -39,10 +42,10 @@ httpsc.recv(fd, size)       -- size is optional
 ### Set configure
 ```lua
 httpsc.set_conf({
-	init_lib = true, 		-- load openssl libary, default: true
-	async = true,			-- work under non-blocking, default: true
-	send_timeout = 3000,	-- socket send timeout, default: 3000 (3 second)
-	recv_timeout = 3000,	-- socket recv timeout, default: 3000 (3 second)
+	init_lib = true,	-- load openssl libary, default: true
+	async = true,		-- work under non-blocking, default: true
+	send_timeout = 10000,	-- socket send timeout, default: 10000 (10 second)
+	recv_timeout = 10000,	-- socket recv timeout, default: 10000 (10 second)
 })
 ```
 
