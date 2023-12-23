@@ -42,10 +42,10 @@
 
 
 #define BUF_SZ      0x1000
-#define MAX_RETRY   32
+#define MAX_SZ      0xA00000
 #define ERROR_FD    -1
 #define HEADER_LMT  8192
-#define TIMEOUT     3000
+#define TIMEOUT     10000
 #define TIMEOUT_M   70000
 
 static int openssl_init = !!NULL;
@@ -59,11 +59,16 @@ typedef struct {
     SSL_CTX *ctx;
 } cutil_conf_t;
 
-enum cutil_conn_st
-{
+enum cutil_conn_st {
     CONNECT_INIT = 1,
-    CONNECT_SSL = 2,
-    CONNECT_DONE = 3
+    CONNECT_PORT = 2,
+    CONNECT_SSL = 3,
+    CONNECT_DONE = 4
+};
+
+enum cutil_proto {
+    PROTO_HTTPS = 1,
+    PROTO_HTTP = 2,
 };
 
 typedef struct {
@@ -72,6 +77,7 @@ typedef struct {
     int in_async;
     int header;
     enum cutil_conn_st status;
+    enum cutil_proto proto;
 } cutil_fd_t;
 
 static cutil_conf_t* fetch_config(lua_State *L) {
@@ -164,6 +170,16 @@ static int lconnect(lua_State *L) {
     
     const char * addr = luaL_checkstring(L, 1);
     int port = luaL_checkinteger(L, 2);
+    enum cutil_proto proto = PROTO_HTTPS;
+    if (lua_gettop(L) > 2) {
+        const char * _proto = luaL_checkstring(L, 3);
+        if (strcmp(_proto, "http") == 0) {
+            proto = PROTO_HTTP;
+        } else if (strcmp(_proto, "https") != 0) {
+            luaL_error(L, "proto invalid");
+            return 0;
+        }
+    }
 
     cutil_fd_t* fd_t = lua_newuserdata(L, sizeof(cutil_fd_t));
     if (!fd_t) {
@@ -175,6 +191,8 @@ static int lconnect(lua_State *L) {
     fd_t->status = CONNECT_INIT;
     fd_t->in_async = cfg->is_async;
     fd_t->header = 0;
+    fd_t->proto = proto;
+
 
     if (luaL_newmetatable(L, "https_socket")) {
         lua_pushcfunction(L, _gc_fd);
@@ -222,6 +240,14 @@ static int lconnect(lua_State *L) {
         }
     }
 
+    if (fd_t->proto == PROTO_HTTP) {
+        if (!fd_t->in_async)
+            fd_t->status = CONNECT_DONE;
+        else
+            fd_t->status = CONNECT_PORT;
+        return 1;
+    }
+
     SSL *ssl = SSL_new(cfg->ctx);
     if (!ssl) {
         luaL_error(L, "ssl_new error, errno = %d", errno);
@@ -249,6 +275,34 @@ static int lcheck_connect(lua_State *L) {
     if (!fd_t) {
         luaL_error(L, "fd error");
         return 0;
+    }
+
+    if (fd_t->status == CONNECT_PORT) {
+        struct pollfd fds;
+        int ret, err;
+        fds.fd = fd_t->fd;
+        fds.events = POLLIN | POLLOUT;
+        /* get status immediately */
+        ret = poll(&fds, 1, 0);
+        if (ret == -1) {
+            luaL_error(L, "connect poll error, ret = %d", ret);
+            return 0;
+        }
+
+        socklen_t len = sizeof(int);
+        ret = getsockopt(fd_t->fd, SOL_SOCKET, SO_ERROR, &err, &len);
+        if (ret < 0) {
+            luaL_error(L, "getsockopt error, ret = %d", ret);
+            return 0;
+        }
+
+        if (err != 0) {
+            if (errno != EAGAIN && errno != EINTR && errno != EINPROGRESS ) {
+                luaL_error(L, "connect sockopt error, errno = %d", errno);
+            }
+            return 0;
+        }
+        fd_t->status = CONNECT_DONE;
     }
 
     if (fd_t->status == CONNECT_SSL) {
@@ -293,19 +347,26 @@ static int lsend(lua_State *L) {
     }
     fd_t->header = 0;
 
+    int r;
     SSL* ssl = fd_t->ssl;
-    int r = SSL_write(ssl, msg, (int)sz);
+    if (fd_t->proto == PROTO_HTTPS)
+        r = SSL_write(ssl, msg, (int)sz);
+    else
+        r = send(fd_t->fd, msg, (int)sz, 0);
     if (r > 0) {
         lua_pushinteger(L, r);
         return 1;
     }
-    if (errno == EAGAIN || errno == EINTR) {
+    int err = errno;
+    if (fd_t->in_async && (err == EAGAIN || err == EINTR)) {
         lua_pushinteger(L, 0);
         return 1;
     }
-    int err = errno;
-    int sslerr = SSL_get_error(ssl, r);
-    ERR_clear_error();
+    int sslerr = 0;
+    if (fd_t->proto == PROTO_HTTPS) {
+        sslerr = SSL_get_error(ssl, r);
+        ERR_clear_error();
+    }
     /*
      *    Possible error: 
      *    "error:1409F07F:SSL routines:SSL3_WRITE_PENDING: bad write retry" error
@@ -337,7 +398,7 @@ static int lrecv(lua_State *L) {
     }
 
     char buffer[BUF_SZ];
-    int size = BUF_SZ * MAX_RETRY;
+    int size = MAX_SZ;
     if (lua_gettop(L) > 1 && lua_isnumber(L, 2)) {
         int _size = lua_tointeger(L, 2);
         if (_size > 0)
@@ -358,14 +419,22 @@ static int lrecv(lua_State *L) {
             }
         }
         
-        int r = SSL_read(ssl, buffer, sz);
+        int r;
+        if (fd_t->proto == PROTO_HTTPS)
+            r = SSL_read(ssl, buffer, sz);
+        else
+            r = recv(fd_t->fd, buffer, sz, 0);
         if (r < 0) {
-            int sslerr = SSL_get_error(ssl, r);
-            ERR_clear_error();
-            if (sslerr == SSL_ERROR_WANT_READ || sslerr == SSL_ERROR_WANT_WRITE) {
+            int sslerr = 0;
+            if (fd_t->proto == PROTO_HTTPS) {          
+                sslerr = SSL_get_error(ssl, r);
+                ERR_clear_error();
+            }
+            int err = errno;
+            if (fd_t->in_async && (err == EAGAIN || err == EINTR)) {
                 break;
             }
-            luaL_error(L, "recv error: %d", sslerr);
+            luaL_error(L, "recv error: %s (%d), ssl_error : %d", strerror(err), err, sslerr);
             return 0;
         }
         if (r == 0)
