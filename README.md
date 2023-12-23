@@ -18,7 +18,7 @@ fd = httpsc.connect(ip, port)
 ```
 
 
-### Check connection is ready, only for async
+### Check connection is ready, only for non-blocking request
 ```lua
 -- Check connection
 while true do
