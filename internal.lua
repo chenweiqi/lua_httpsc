@@ -1,5 +1,11 @@
 local table = table
 local type = type
+local string = string
+local tonumber = tonumber
+local pcall = pcall
+local assert = assert
+local error = error
+local pairs = pairs
 
 local M = {}
 
@@ -48,9 +54,6 @@ function M.recvheader(readbytes, lines, header)
 		while true do
 			local bytes = readbytes()
 			header = header .. bytes
-			if #header > LIMIT then
-				return
-			end
 			e = header:find("\r\n\r\n", -#bytes-3, true)
 			if e then
 				result = header:sub(e+4)
@@ -58,6 +61,9 @@ function M.recvheader(readbytes, lines, header)
 			end
 			if header:find "^\r\n" then
 				return header:sub(3)
+			end
+			if #header > LIMIT then
+				return
 			end
 		end
 	end
@@ -104,29 +110,29 @@ function M.recvchunkedbody(readbytes, bodylimit, header, body)
 	local result = ""
 	local size = 0
 
-	local sz
 	while true do
-		if sz then
-			body = body .. readbytes(sz - #body)
-			if #body >= sz then
-				result = result .. body:sub(1,sz)
-				body = body:sub(sz+1)
-				body = readcrln(readbytes, body)
-				if not body then
-					return
-				end
-				sz = nil
-			end
-		end
-
+		local sz
+		sz , body = chunksize(readbytes, body)
 		if not sz then
-			sz , body = chunksize(readbytes, body)
-			if not sz then
-				return
-			end
-			if sz == 0 then
-				break
-			end
+			return
+		end
+		if sz == 0 then
+			break
+		end
+		size = size + sz
+		if bodylimit and size > bodylimit then
+			return
+		end
+		if #body >= sz then
+			result = result .. body:sub(1,sz)
+			body = body:sub(sz+1)
+		else
+			result = result .. body .. readbytes(sz - #body)
+			body = ""
+		end
+		body = readcrln(readbytes, body)
+		if not body then
+			return
 		end
 	end
 
@@ -141,104 +147,94 @@ function M.recvchunkedbody(readbytes, bodylimit, header, body)
 	return result, header
 end
 
-function M.request(httpsc, fd)
-	local function read(sz)
-		return httpsc.recv(fd, sz) or ""
+local function recvbody(interface, code, header, body)
+	local length = header["content-length"]
+	if length then
+		length = tonumber(length)
 	end
-	local function write(msg)
-		while true do
-			local send_len = httpsc.send(fd, msg)
-			if send_len > 0 then
-				if send_len >= #msg then
-					break
-				end
-				msg = msg:sub(send_len+1)
-			else
-				httpsc.usleep(1000)
-			end
+	if length then
+		if #body >= length then
+			body = body:sub(1,length)
+		else
+			local padding = interface.read(length - #body)
+			body = body .. padding
 		end
+	elseif code == 204 or code == 304 or code < 200 then
+		body = ""
+		-- See https://stackoverflow.com/questions/15991173/is-the-content-length-header-required-for-a-http-1-0-response
+	else
+		-- no content-length, read all
+		body = body .. interface.readall()
 	end
-
-	return function(method, host, url, recvheader, header, content)
-		local header_content = ""
-		if header then
-			if not header.host then
-				header.host = host
-			end
-			for k,v in pairs(header) do
-				header_content = string.format("%s%s:%s\r\n", header_content, k, v)
-			end
-		else
-			header_content = string.format("host:%s\r\n",host)
-		end
-
-		local data
-		if content then
-			data = string.format("%s %s HTTP/1.1\r\n%scontent-length:%d\r\n\r\n%s", method, url, header_content, #content, content)
-		else
-			data = string.format("%s %s HTTP/1.1\r\n%scontent-length:0\r\n\r\n", method, url, header_content)
-		end
-		-- print(#data)
-		-- print(data)
-		write(data)
-		--httpsc.usleep(1000000)
-		local tmpline = {}
-		local body = M.recvheader(read, tmpline, "")
-		if not body then
-			error("socket_error")
-		end
-
-		local statusline = tmpline[1]
-		local code, info = statusline:match "HTTP/[%d%.]+%s+([%d]+)%s+(.*)$"
-		code = assert(tonumber(code))
-
-		local header = M.parseheader(tmpline,2,recvheader or {})
-		if not header then
-			error("Invalid HTTP response header")
-		end
-
-		local length = header["content-length"]
-		if length then
-			length = tonumber(length)
-		end
-
-		local mode = header["transfer-encoding"]
-		if mode then
-			if mode ~= "identity" and mode ~= "chunked" then
-				error ("Unsupport transfer-encoding")
-			end
-		end
-
-		if mode == "chunked" then
-			body, header = M.recvchunkedbody(read, nil, header, body)
-			if not body then
-				error("Invalid response body")
-			end
-		else
-			-- print(length)
-			if length then
-				if #body >= length then
-					body = body:sub(1,length)
-				else
-					while true do
-						local padding = read(length - #body)
-						if #padding>0 then
-							body = body .. padding
-							if #body>= length then
-								body = body:sub(1,length)
-								break
-							end
-						else
-							httpsc.usleep(1000)
-						end
-					end
-				end
-			else
-				body = nil
-			end
-		end
-		return code, body
-	end
+	return body
 end
+
+function M.request(interface, method, host, url, recvheader, header, content)
+	local read = interface.read
+	local write = interface.write
+	local header_content = ""
+	if header then
+		if not header.Host then
+			header.Host = host
+		end
+		for k,v in pairs(header) do
+			header_content = string.format("%s%s:%s\r\n", header_content, k, v)
+		end
+	else
+		header_content = string.format("host:%s\r\n",host)
+	end
+
+	if content then
+		local data
+		if header and header["transfer-encoding"] == "chunked" then
+			data = string.format("%s %s HTTP/1.1\r\n%s\r\n", method, url, header_content)
+		else
+			data = string.format("%s %s HTTP/1.1\r\n%sContent-length:%d\r\n\r\n", method, url, header_content, #content)
+		end
+		write(data)
+		write(content)
+	else
+		local request_header = string.format("%s %s HTTP/1.1\r\n%sContent-length:0\r\n\r\n", method, url, header_content)
+		write(request_header)
+	end
+
+	local tmpline = {}
+	local body = M.recvheader(read, tmpline, "")
+	if not body then
+		error("Recv header failed")
+	end
+
+	local statusline = tmpline[1]
+	local code, info = statusline:match "HTTP/[%d%.]+%s+([%d]+)%s+(.*)$"
+	code = assert(tonumber(code))
+
+	local header = M.parseheader(tmpline,2,recvheader or {})
+	if not header then
+		error("Invalid HTTP response header")
+	end
+	return code, body, header
+end
+
+function M.response(interface, code, body, header)
+	local mode = header["transfer-encoding"]
+	if mode then
+		if mode ~= "identity" and mode ~= "chunked" then
+			error ("Unsupport transfer-encoding")
+		end
+	end
+
+	if mode == "chunked" then
+		body, header = M.recvchunkedbody(interface.read, nil, header, body)
+		if not body then
+			error("Invalid response body")
+		end
+	else
+		-- identity mode
+		body = recvbody(interface, code, header, body)
+	end
+
+	return body
+end
+
 
 return M

@@ -28,6 +28,7 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <time.h>
+#include <ctype.h>
 
 #include <netinet/in.h>
 #include <sys/types.h>
@@ -36,9 +37,10 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
-#include "openssl/ssl.h"
-#include "openssl/err.h"
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include <poll.h>
+#include <netdb.h>
 
 
 #define BUF_SZ      0x1000
@@ -164,21 +166,89 @@ static int _connect_ssl(lua_State *L, cutil_fd_t* fd_t) {
     return 1;
 }
 
+// 轻量检查域名合法字符（字母、数字、-、.）
+static int _is_valid_domain(const char *str) {
+    for (int i=0; str[i]; i++) {
+        if (!isalnum(str[i]) && str[i] != '-' && str[i] != '.') {
+            return 0;
+        }
+        // 简单排除连续点号（如 "www..baidu.com"）
+        if (str[i] == '.' && (i==0 || str[i+1]=='.' || str[i+1]=='\0')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// 判断ip或域名
+static int _check_addr(const char *str) {
+    if (str == NULL || strlen(str) == 0) return 0;
+
+    struct in_addr ipv4;
+    if (inet_pton(AF_INET, str, &ipv4) == 1) return 1;
+
+    struct in6_addr ipv6;
+    if (inet_pton(AF_INET6, str, &ipv6) == 1) return 2;
+
+    // 非 IP + 合法域名字符 → 判定为域名
+    return _is_valid_domain(str) ? 3 : 0;
+}
+
+// 解析域名获取 IP 地址
+static char* _resolve_host(lua_State *L, const char* hostname) {
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(hostname, NULL, &hints, &res) != 0) {
+        luaL_error(L, "getaddrinfo fail: %s", gai_strerror(errno));
+        return NULL;
+    }
+
+    struct sockaddr_in* addr = (struct sockaddr_in*)res->ai_addr;
+    char* ip = malloc(INET_ADDRSTRLEN);
+    inet_ntop(AF_INET, &addr->sin_addr, ip, INET_ADDRSTRLEN);
+    freeaddrinfo(res);
+    return ip;
+}
+
+
 static int lconnect(lua_State *L) {
     cutil_conf_t* cfg = fetch_config(L);
     if (!cfg) return 0;
     
     const char * addr = luaL_checkstring(L, 1);
-    int port = luaL_checkinteger(L, 2);
+    int addr_type = _check_addr(addr);
+    const char* host = NULL;
+    if (addr_type == 3) {
+        host = addr;
+    } else if (addr_type != 1) {
+        luaL_error(L, "addr invalid");
+        return 0;
+    }
     enum cutil_proto proto = PROTO_HTTPS;
-    if (lua_gettop(L) > 2) {
-        const char * _proto = luaL_checkstring(L, 3);
-        if (strcmp(_proto, "http") == 0) {
-            proto = PROTO_HTTP;
-        } else if (strcmp(_proto, "https") != 0) {
-            luaL_error(L, "proto invalid");
+    const char* _proto = luaL_optstring(L, 3, "https");
+    if (strcmp(_proto, "http") == 0) {
+        proto = PROTO_HTTP;
+    } else if (strcmp(_proto, "https") != 0) {
+        luaL_error(L, "proto invalid");
+        return 0;
+    }
+    int port = (int)luaL_optinteger(L, 2, 0);
+    if (port == 0) port = proto == PROTO_HTTP ? 80 : 443;
+
+    in_addr_t ipaddr;
+    if (addr_type == 1) {
+        ipaddr = inet_addr(addr);
+    } else {
+        char *ip = _resolve_host(L, addr);
+        if (!ip) {
+            luaL_error(L, "resolve host fail:%s", addr);
             return 0;
         }
+        ipaddr = inet_addr(ip);
+        free(ip);
     }
 
     cutil_fd_t* fd_t = lua_newuserdata(L, sizeof(cutil_fd_t));
@@ -205,7 +275,7 @@ static int lconnect(lua_State *L) {
     fd_t->fd = fd;
 
     bzero(&my_addr, sizeof(my_addr));
-    my_addr.sin_addr.s_addr = inet_addr(addr);
+    my_addr.sin_addr.s_addr = ipaddr;
     my_addr.sin_family = AF_INET;
     my_addr.sin_port = htons(port);
 
@@ -219,11 +289,18 @@ static int lconnect(lua_State *L) {
         luaL_error(L, "set send timeout failed");
         return 0;
     }
-    timeo.tv_sec = cfg->rcv_tmo / 1000;;
+    timeo.tv_sec = cfg->rcv_tmo / 1000;
     timeo.tv_usec = (cfg->rcv_tmo % 1000) * 1000;
     ret = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeo, len);
     if (ret) {
         luaL_error(L, "set recv timeout failed");
+        return 0;
+    }
+
+    int reuse = 1;
+    ret = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    if (ret) {
+        luaL_error(L, "set reuse failed");
         return 0;
     }
 
@@ -256,6 +333,9 @@ static int lconnect(lua_State *L) {
     fd_t->ssl = ssl;
     fd_t->status = CONNECT_SSL;
     SSL_set_fd(ssl, fd);
+    if (host) {
+        SSL_set_tlsext_host_name(ssl, host);
+    }
 
     ret = _connect_ssl(L, fd_t);
     if (!fd_t->in_async) {

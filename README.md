@@ -1,5 +1,9 @@
 # lua_httpsc
-A non-blocking https client library for lua, it also support blocking request, http request
+A non-blocking https client library for lua, it also support http request
+
+## Require
+openssl >= 1.0.1
+lua >= 5.3
 
 
 ## API
@@ -9,12 +13,12 @@ httpsc = require "httpsc"
 
 ### Connect remote https server
 ```lua
-local ip = "127.0.0.1"
+local host = "www.baidu.com"
 local port = 443
 
-fd = httpsc.connect(ip, port)
--- fd = httpsc.connect(ip, port, "http")
--- fd = httpsc.connect(ip, port, "https")
+fd = httpsc.connect(host, port)  -- default https
+-- fd = httpsc.connect(host, port, "http")
+-- fd = httpsc.connect(host, port, "https")
 ```
 
 

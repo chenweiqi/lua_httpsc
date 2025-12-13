@@ -2,7 +2,6 @@ local skynet = require "skynet"
 require "skynet.manager"
 local httpsc = require "httpsc"
 local internal = require "http.internal"
-local dns = require "dns"
 
 local retry_time = 20      -- 超时重试次数
 local retry_time_base = 5  -- 多久(单位0.1秒)重试一次
@@ -36,21 +35,6 @@ local logger = {
         logger_msg("error", ...)
     end
 }
-
-local host_cache = {}
-local function getip(host, is_fresh)
-    if not is_fresh and host_cache[host] then
-        return host_cache[host]
-    end
-    local ip, ips = dns.resolve(host)
-    for k,v in ipairs(ips) do
-        if host_cache[host] ~= v then
-            host_cache[host] = v
-            break
-        end
-    end
-    return host_cache[host]
-end
 
 local function handle_err(e)
     e = debug.traceback(coroutine.running(), tostring(e), 2)
@@ -196,7 +180,7 @@ local function do_timeout()
             if now - connection.time > timeout_connect then
                 connections[co] = nil
                 connection.error = "connect timeout"
-                httpsc.close(connection.fd)
+                -- httpsc.close(connection.fd)
                 skynet.wakeup(co)
             end
         end
@@ -254,34 +238,34 @@ local function raw_job(request, requests, job_fun, error_tip, timeout_tip)
     finish_request(requests, request, ret_text, ret_step)
 end
 
+local function check_protocol(host)
+    local protocol = host:match("^[Hh][Tt][Tt][Pp][Ss]?://")
+    if protocol then
+        host = string.gsub(host, "^"..protocol, "")
+        protocol = string.lower(protocol)
+        if protocol == "https://" then
+            return "https", host
+        elseif protocol == "http://" then
+            return "http", host
+        else
+            error(string.format("Invalid protocol: %s", protocol))
+        end
+    else
+        return "http", host
+    end
+end
 
 local function raw_request(method, host, url, header, content)
-    local hostname, port = host:match"([^:]+):?(%d*)$"
+    local protocol
+    protocol, host = check_protocol(host)
+    local hostaddr, port = host:match"([^:]+):?(%d*)$"
     if port == "" then
-        port = 443
+        port = protocol=="http" and 80 or protocol=="https" and 443
     else
         port = tonumber(port)
     end
-    --get ip of the host
-    local svrip = getip(hostname, false)
-    local ok, fd
-    if svrip then
-        ok, fd = pcall(httpsc.connect, svrip, port)
-    else
-        ok, fd = nil, "getip nil"
-    end
-    if not ok then --if conn fail, retry once
-        if svrip ~= hostname then
-            logger.err("https_client raw_request connect fail, will retry once, error = %s", fd)
-            --resolve host again
-            svrip = getip(hostname, true)
-            if svrip then
-                ok, fd = pcall(httpsc.connect, svrip, port)
-            else
-                ok, fd = nil, "refreship nil"
-            end
-        end
-    end
+
+    local ok, fd = pcall(httpsc.connect, hostaddr, port, protocol)
     if not ok then
         logger.err("https_client raw_request connect fail, err = %s", fd)
         return false, fd
@@ -295,7 +279,7 @@ local function raw_request(method, host, url, header, content)
     connections[self_co] = connection
     skynet.wait()
     if connection.error then
-        httpsc.close(fd)
+        -- httpsc.close(fd)
         return false, connection.error
     end
 
@@ -331,7 +315,7 @@ local function raw_request(method, host, url, header, content)
     request.fd = nil
     request.data = nil
     if request.step ~= req_step.finish then
-        httpsc.close(fd)
+        -- httpsc.close(fd)
         return false, request.error
     end
     
@@ -365,7 +349,7 @@ function command.request(method, host, url, header, content)
     request.co = nil
     request.fd = nil
 
-    httpsc.close(fd)
+    -- httpsc.close(fd)
     if request.step ~= req_step.finish then
         logger.err("https_client request timeout, host = %s, url = %s, err = %s", host, url, request.ret)
         return false, request.ret or "request timeout"
@@ -410,8 +394,6 @@ end
 
 skynet.start(function()
     logger.info("https_client starting...")
-
-    print("nameserver:", dns.server())  -- set nameserver
 
     skynet.fork(do_connect)
     skynet.fork(do_timeout)
