@@ -89,6 +89,10 @@ print("GET blocking https://www.baidu.com")
 local code, body = http_request("GET", "https://www.baidu.com", "/")
 print(code, body and #body)
 
+print("GET blocking https://api.iplocation.net/?ip=8.8.8.8")
+local code, body = http_request("GET", "https://api.iplocation.net", "/?ip=8.8.8.8")
+print(code, body and #body)
+
 -- gc
 httpsc = nil
 request = nil

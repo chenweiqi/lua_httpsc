@@ -46,7 +46,6 @@
 #define BUF_SZ      0x1000
 #define MAX_SZ      0xA00000
 #define ERROR_FD    -1
-#define HEADER_LMT  8192
 #define TIMEOUT     10000
 #define TIMEOUT_M   70000
 
@@ -493,11 +492,6 @@ static int lrecv(lua_State *L) {
 
     for (;;) {
         sz = size < BUF_SZ ? size : BUF_SZ;
-        if (fd_t->header >= 0) {
-            if (sz + fd_t->header > HEADER_LMT) {
-                sz = HEADER_LMT - fd_t->header;
-            }
-        }
         
         int r;
         if (fd_t->proto == PROTO_HTTPS)
@@ -527,15 +521,11 @@ static int lrecv(lua_State *L) {
 
         bset = 1;
         luaL_addlstring(&b, (const char*)buffer, r);
-        size -= r;
 
-        if (fd_t->header >= 0) {
-            fd_t->header += r;
-            if (fd_t->header >= HEADER_LMT){
-                fd_t->header = -1;
-                break;
-            }
-        }
+        if (r < sz)
+            break;
+
+        size -= r;
         if (size <= 0)
             break;
     }
