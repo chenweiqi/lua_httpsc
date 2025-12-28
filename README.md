@@ -2,8 +2,8 @@
 A non-blocking https client library for lua, it also support http request
 
 ## Require
-openssl >= 1.0.1
-lua >= 5.3
+- openssl >= 1.0.1
+- lua >= 5.3
 
 
 ## API
@@ -22,7 +22,8 @@ fd = httpsc.connect(host, port)  -- default https
 ```
 
 
-### Check connection is ready, only for non-blocking request
+### Check connection is ready, mostly for non-blocking request
+it can also check whether connection is alive for connection reuse
 ```lua
 -- Check connection
 while true do
@@ -40,6 +41,12 @@ httpsc.send(fd, msg)
 ### Receive data from remote
 ```lua
 httpsc.recv(fd, size)       -- size is optional
+```
+
+### Set domain-ip map
+set_ip is not necessary, but it is suggested for non-blocking request, because dns resolve is blocking currently
+```lua
+httpsc.set_ip(domain, ip)
 ```
 
 

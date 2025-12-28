@@ -49,7 +49,7 @@
 #define TIMEOUT     10000
 #define TIMEOUT_M   70000
 
-static int openssl_init = !!NULL;
+static int openssl_init = 0;
 
 typedef struct {
     int is_init;
@@ -96,12 +96,12 @@ static cutil_conf_t* fetch_config(lua_State *L) {
 
     if (!cfg->ssl_init) {
         if (!openssl_init) {
-            openssl_init = !NULL;
+            openssl_init = 1;
             SSL_library_init();
             OpenSSL_add_all_algorithms();
             SSL_load_error_strings();
         }
-        cfg->ssl_init = !NULL;
+        cfg->ssl_init = 1;
     }
 
     if (!cfg->ctx) {
@@ -165,13 +165,14 @@ static int _connect_ssl(lua_State *L, cutil_fd_t* fd_t) {
     return 1;
 }
 
-// 轻量检查域名合法字符（字母、数字、-、.）
+// check if domain valid
 static int _is_valid_domain(const char *str) {
-    for (int i=0; str[i]; i++) {
+    int i;
+    for (i=0; str[i]; i++) {
         if (!isalnum(str[i]) && str[i] != '-' && str[i] != '.') {
             return 0;
         }
-        // 简单排除连续点号（如 "www..baidu.com"）
+        // simple check（such as "www..example.com"）
         if (str[i] == '.' && (i==0 || str[i+1]=='.' || str[i+1]=='\0')) {
             return 0;
         }
@@ -179,7 +180,7 @@ static int _is_valid_domain(const char *str) {
     return 1;
 }
 
-// 判断ip或域名
+// check if ip or domain
 static int _check_addr(const char *str) {
     if (str == NULL || strlen(str) == 0) return 0;
 
@@ -189,11 +190,10 @@ static int _check_addr(const char *str) {
     struct in6_addr ipv6;
     if (inet_pton(AF_INET6, str, &ipv6) == 1) return 2;
 
-    // 非 IP + 合法域名字符 → 判定为域名
     return _is_valid_domain(str) ? 3 : 0;
 }
 
-// 解析域名获取 IP 地址
+// dns resolve IP addr
 static char* _resolve_host(lua_State *L, const char* hostname) {
     struct addrinfo hints, *res;
     memset(&hints, 0, sizeof(hints));
@@ -241,10 +241,23 @@ static int lconnect(lua_State *L) {
     if (addr_type == 1) {
         ipaddr = inet_addr(addr);
     } else {
-        char *ip = _resolve_host(L, addr);
+        char *ip = NULL;
+        // get ip from dns_map
+        lua_pushvalue(L, lua_upvalueindex(2));
+        lua_pushstring(L, addr);
+        lua_gettable(L, -2);
+        if (!lua_isnil(L, -1)) {
+            ip = strdup(lua_tostring(L, -1));
+        }
+        lua_pop(L, 2);
+
         if (!ip) {
-            luaL_error(L, "resolve host fail:%s", addr);
-            return 0;
+            // todo getaddrinfo blocking
+            ip = _resolve_host(L, addr);
+            if (!ip) {
+                luaL_error(L, "resolve host fail:%s", addr);
+                return 0;
+            }
         }
         ipaddr = inet_addr(ip);
         free(ip);
@@ -261,7 +274,6 @@ static int lconnect(lua_State *L) {
     fd_t->in_async = cfg->is_async;
     fd_t->header = 0;
     fd_t->proto = proto;
-
 
     if (luaL_newmetatable(L, "https_socket")) {
         lua_pushcfunction(L, _gc_fd);
@@ -356,12 +368,37 @@ static int lcheck_connect(lua_State *L) {
         return 0;
     }
 
+    if (fd_t->status == CONNECT_DONE) {
+        if (fd_t->fd == ERROR_FD) {
+            return 0;
+        }
+
+        int ret;
+        struct pollfd fds;
+        fds.fd = fd_t->fd;
+        fds.events = POLLHUP | POLLERR;
+        ret = poll(&fds, 1, 0);
+        if (ret < 0) {
+            return 0;
+        }
+        if (fds.revents & (POLLHUP | POLLERR)) {
+            return 0;
+        }
+
+        if (fd_t->proto == PROTO_HTTPS) {
+            if (!fd_t->ssl || SSL_get_shutdown(fd_t->ssl) != 0) {
+                return 0;
+            }
+        }
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
     if (fd_t->status == CONNECT_PORT) {
         struct pollfd fds;
         int ret, err;
         fds.fd = fd_t->fd;
         fds.events = POLLIN | POLLOUT;
-        /* get status immediately */
         ret = poll(&fds, 1, 0);
         if (ret == -1) {
             luaL_error(L, "connect poll error, ret = %d", ret);
@@ -558,10 +595,10 @@ static int _gc(lua_State *L) {
 static void _create_config(lua_State *L) {
     cutil_conf_t *cfg;
     cfg = lua_newuserdata(L, sizeof(*cfg));
-    cfg->is_init = !!NULL;
-    cfg->ssl_init = !!NULL;
+    cfg->is_init = 0;
+    cfg->ssl_init = 0;
     cfg->ctx = NULL;
-    cfg->is_async = !NULL;
+    cfg->is_async = 1;
     cfg->snd_tmo = TIMEOUT;
     cfg->rcv_tmo = TIMEOUT;
     /* Create GC to clean up ctx */
@@ -569,7 +606,7 @@ static void _create_config(lua_State *L) {
     lua_pushcfunction(L, _gc);
     lua_setfield(L, -2, "__gc");
     lua_setmetatable(L, -2);
-    cfg->is_init = !NULL;
+    cfg->is_init = 1;
 }
 
 static int lset_conf(lua_State *L) {
@@ -584,7 +621,7 @@ static int lset_conf(lua_State *L) {
     if (!lua_isnil(L, -1)) {
         luaL_checktype(L, -1, LUA_TBOOLEAN);
         if (!lua_toboolean(L, -1))
-            cfg->ssl_init = !NULL;
+            cfg->ssl_init = 1;
     }
     lua_pop(L, 1);
 
@@ -593,7 +630,7 @@ static int lset_conf(lua_State *L) {
     if (!lua_isnil(L, -1)) {
         luaL_checktype(L, -1, LUA_TBOOLEAN);
         if (!lua_toboolean(L, -1))
-            cfg->is_async = !!NULL;
+            cfg->is_async = 0;
     }
     lua_pop(L, 1);
 
@@ -620,6 +657,55 @@ static int lset_conf(lua_State *L) {
     return 0;
 }
 
+static int lset_ip(lua_State *L) {
+    cutil_conf_t* cfg = fetch_config(L);
+    if (!cfg) return 0;
+    
+    const char *domain = luaL_checkstring(L, 1);
+    const char *ip = luaL_checkstring(L, 2);
+    
+    struct in_addr ipv4;
+    if (inet_pton(AF_INET, ip, &ipv4) != 1) {
+        luaL_error(L, "invalid IPv4 address: %s", ip);
+        return 0;
+    }
+    
+    if (!_is_valid_domain(domain)) {
+        luaL_error(L, "invalid domain: %s", domain);
+        return 0;
+    }
+    
+    // set domain-ip in dns_map
+    lua_pushvalue(L, lua_upvalueindex(2));
+    lua_pushstring(L, domain);
+    lua_pushstring(L, ip);
+    lua_settable(L, -3);
+    lua_pop(L, 1); 
+    
+    return 0;
+}
+
+static int ldns_resolve(lua_State *L) {
+    cutil_conf_t* cfg = fetch_config(L);
+    if (!cfg) return 0;
+
+    const char *domain = luaL_checkstring(L, 1);
+    if (!_is_valid_domain(domain)) {
+        luaL_error(L, "invalid domain: %s", domain);
+        return 0;
+    }
+
+    // todo getaddrinfo blocking
+    char* ip = _resolve_host(L, domain);
+    if (!ip) {
+        luaL_error(L, "resolve host fail:%s", domain);
+        return 0;
+    }
+    lua_pushstring(L, ip);
+    free(ip);
+    return 1;
+}
+
 
 int luaopen_httpsc(lua_State *L) {
     static const luaL_Reg funcs[] = {
@@ -628,15 +714,18 @@ int luaopen_httpsc(lua_State *L) {
         { "recv", lrecv },
         { "send", lsend },
         { "set_conf", lset_conf },
+        { "set_ip", lset_ip },
         { "usleep", lusleep },
+        { "dns_resolve", ldns_resolve },
         /* useless */
         { "close", luseless },
         {NULL, NULL}
     };
 
     lua_newtable(L);
-    _create_config(L);
-    luaL_setfuncs(L, funcs, 1);
+    _create_config(L);  // config
+    lua_newtable(L);    // dns_map
+    luaL_setfuncs(L, funcs, 2);
 
     return 1;
 }
