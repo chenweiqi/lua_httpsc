@@ -200,8 +200,9 @@ static char* _resolve_host(lua_State *L, const char* hostname) {
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
-    if (getaddrinfo(hostname, NULL, &hints, &res) != 0) {
-        luaL_error(L, "getaddrinfo fail: %s", gai_strerror(errno));
+    int ret = getaddrinfo(hostname, NULL, &hints, &res);
+    if (ret != 0) {
+        luaL_error(L, "getaddrinfo fail: %s", gai_strerror(ret));
         return NULL;
     }
 

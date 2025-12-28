@@ -111,7 +111,7 @@ function http_request(method, host, url, recvheader, header, content)
 		port = tonumber(port)
 	end
 
-	local pool_key = string.format("%s:%s", hostaddr, port, protocol)
+	local pool_key = string.format("%s:%s:%s", hostaddr, port, protocol)
 	connect_pools = connect_pools or {}
 	local fd = connect_pools[pool_key]
 	if fd then
