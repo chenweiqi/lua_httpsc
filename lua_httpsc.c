@@ -341,6 +341,7 @@ static int lconnect(lua_State *L) {
     fd_t->header = 0;
     fd_t->proto = proto;
     fd_t->port = port;
+    fd_t->dns_thread = 0;
     if (host) snprintf(fd_t->sni_host, sizeof(fd_t->sni_host), "%s", host);
 
     if (luaL_newmetatable(L, "https_socket")) {
@@ -371,6 +372,7 @@ static int lconnect(lua_State *L) {
                 fd_t->dns_done = 0;
                 fd_t->status = CONNECT_DNS;
                 if (pthread_create(&fd_t->dns_thread, NULL, _resolve_host, fd_t) != 0) {
+                    fd_t->dns_thread = 0;
                     luaL_error(L, "create dns thread failed");
                     return 0;
                 }
