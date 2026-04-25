@@ -44,7 +44,7 @@ httpsc.recv(fd, size)       -- size is optional
 ```
 
 ### Set domain-ip map
-set_ip is not necessary, but it is suggested for non-blocking request, because dns resolve is blocking currently
+set_ip is not necessary, but it is suggested
 ```lua
 httpsc.set_ip(domain, ip)
 ```
