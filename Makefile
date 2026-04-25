@@ -30,7 +30,7 @@ OBJS =              lua_httpsc.o
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(LDFLAGS) $(CUTIL_LDFLAGS) -Iinclude -o $@ $(OBJS) -lssl
+	$(CC) $(LDFLAGS) $(CUTIL_LDFLAGS) -Iinclude -o $@ $(OBJS) -lssl -lpthread
 
 install: $(TARGET)
 	mkdir -p $(DESTDIR)$(LUA_CMODULE_DIR)

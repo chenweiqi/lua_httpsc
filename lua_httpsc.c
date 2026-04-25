@@ -41,6 +41,7 @@
 #include <openssl/err.h>
 #include <poll.h>
 #include <netdb.h>
+#include <pthread.h>
 
 
 #define BUF_SZ      0x1000
@@ -61,6 +62,7 @@ typedef struct {
 } cutil_conf_t;
 
 enum cutil_conn_st {
+    CONNECT_DNS = 0,
     CONNECT_INIT = 1,
     CONNECT_PORT = 2,
     CONNECT_SSL = 3,
@@ -79,6 +81,13 @@ typedef struct {
     int header;
     enum cutil_conn_st status;
     enum cutil_proto proto;
+    int port;
+    char sni_host[256];
+    int dns_done;
+    pthread_t dns_thread;
+    char dns_err[256];
+    char dns_ip[INET_ADDRSTRLEN];
+    char dns_hostname[256];
 } cutil_fd_t;
 
 static cutil_conf_t* fetch_config(lua_State *L) {
@@ -120,6 +129,11 @@ static cutil_conf_t* fetch_config(lua_State *L) {
 
 static int _gc_fd(lua_State *L) {
     cutil_fd_t* fd_t = lua_touserdata(L, 1);
+    if (fd_t->dns_thread) {
+        void* ret;
+        pthread_join(fd_t->dns_thread, &ret);
+        fd_t->dns_thread = 0;
+    }
     SSL* ssl = fd_t->ssl;
     if (ssl) {
         fd_t->ssl = NULL;
@@ -194,23 +208,103 @@ static int _check_addr(const char *str) {
 }
 
 // dns resolve IP addr
-static char* _resolve_host(lua_State *L, const char* hostname) {
+static void* _resolve_host(void* arg) {
+    cutil_fd_t* fd_t = (cutil_fd_t*)arg;
     struct addrinfo hints, *res;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
-    int ret = getaddrinfo(hostname, NULL, &hints, &res);
+    int ret = getaddrinfo(fd_t->dns_hostname, NULL, &hints, &res);
     if (ret != 0) {
-        luaL_error(L, "getaddrinfo fail: %s", gai_strerror(ret));
-        return NULL;
+        fd_t->dns_done = -1;
+        snprintf(fd_t->dns_err, sizeof(fd_t->dns_err), "getaddrinfo fail: %s", gai_strerror(ret));
+    } else {
+        struct sockaddr_in* addr = (struct sockaddr_in*)res->ai_addr;
+        inet_ntop(AF_INET, &addr->sin_addr, fd_t->dns_ip, sizeof(fd_t->dns_ip));
+        freeaddrinfo(res);
+        fd_t->dns_done = 1;
+    }
+    return NULL;
+}
+
+static int _do_socket_connect(lua_State *L, cutil_fd_t* fd_t, cutil_conf_t* cfg, in_addr_t ipaddr) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in my_addr;
+    fd_t->fd = fd;
+
+    bzero(&my_addr, sizeof(my_addr));
+    my_addr.sin_addr.s_addr = ipaddr;
+    my_addr.sin_family = AF_INET;
+    my_addr.sin_port = htons(fd_t->port);
+
+    int ret;
+    struct timeval timeo;
+    timeo.tv_sec = cfg->snd_tmo / 1000;
+    timeo.tv_usec = (cfg->snd_tmo % 1000) * 1000;
+    socklen_t len = sizeof(timeo);
+    ret = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeo, len);
+    if (ret) {
+        luaL_error(L, "set send timeout failed");
+        return -1;
+    }
+    timeo.tv_sec = cfg->rcv_tmo / 1000;
+    timeo.tv_usec = (cfg->rcv_tmo % 1000) * 1000;
+    ret = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeo, len);
+    if (ret) {
+        luaL_error(L, "set recv timeout failed");
+        return -1;
     }
 
-    struct sockaddr_in* addr = (struct sockaddr_in*)res->ai_addr;
-    char* ip = malloc(INET_ADDRSTRLEN);
-    inet_ntop(AF_INET, &addr->sin_addr, ip, INET_ADDRSTRLEN);
-    freeaddrinfo(res);
-    return ip;
+    int reuse = 1;
+    ret = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    if (ret) {
+        luaL_error(L, "set reuse failed");
+        return -1;
+    }
+
+    if (fd_t->in_async) {
+        int flag = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flag | O_NONBLOCK);
+    }
+
+    ret = connect(fd, (struct sockaddr *)&my_addr, sizeof(struct sockaddr_in));
+    if (ret != 0) {
+        if (errno != EINPROGRESS) {
+            luaL_error(L, "connect failed");
+            return -1;
+        }
+    }
+
+    if (fd_t->proto == PROTO_HTTP) {
+        if (!fd_t->in_async)
+            fd_t->status = CONNECT_DONE;
+        else
+            fd_t->status = CONNECT_PORT;
+        return 0;
+    }
+
+    SSL *ssl = SSL_new(cfg->ctx);
+    if (!ssl) {
+        luaL_error(L, "ssl_new error, errno = %d", errno);
+        return -1;
+    }
+    fd_t->ssl = ssl;
+    fd_t->status = CONNECT_SSL;
+    SSL_set_fd(ssl, fd);
+    if (fd_t->sni_host[0]) {
+        SSL_set_tlsext_host_name(ssl, fd_t->sni_host);
+    }
+
+    ret = _connect_ssl(L, fd_t);
+    if (!fd_t->in_async) {
+        if (ret != 0) {
+            luaL_error(L, "ssl_connect fail");
+            return -1;
+        }
+        fd_t->status = CONNECT_DONE;
+    }
+    return 0;
 }
 
 
@@ -238,12 +332,28 @@ static int lconnect(lua_State *L) {
     int port = (int)luaL_optinteger(L, 2, 0);
     if (port == 0) port = proto == PROTO_HTTP ? 80 : 443;
 
+    cutil_fd_t* fd_t = lua_newuserdata(L, sizeof(cutil_fd_t));
+    memset(fd_t, 0, sizeof(cutil_fd_t));
+    fd_t->fd = ERROR_FD;
+    fd_t->ssl = NULL;
+    fd_t->status = CONNECT_INIT;
+    fd_t->in_async = cfg->is_async;
+    fd_t->header = 0;
+    fd_t->proto = proto;
+    fd_t->port = port;
+    if (host) snprintf(fd_t->sni_host, sizeof(fd_t->sni_host), "%s", host);
+
+    if (luaL_newmetatable(L, "https_socket")) {
+        lua_pushcfunction(L, _gc_fd);
+        lua_setfield(L, -2, "__gc");
+    }
+    lua_setmetatable(L, -2);
+
     in_addr_t ipaddr;
     if (addr_type == 1) {
         ipaddr = inet_addr(addr);
     } else {
         char *ip = NULL;
-        // get ip from dns_map
         lua_pushvalue(L, lua_upvalueindex(2));
         lua_pushstring(L, addr);
         lua_gettable(L, -2);
@@ -252,111 +362,32 @@ static int lconnect(lua_State *L) {
         }
         lua_pop(L, 2);
 
-        if (!ip) {
-            // todo getaddrinfo blocking
-            ip = _resolve_host(L, addr);
-            if (!ip) {
-                luaL_error(L, "resolve host fail:%s", addr);
-                return 0;
+        if (ip) {
+            ipaddr = inet_addr(ip);
+            free(ip);
+        } else {
+            snprintf(fd_t->dns_hostname, sizeof(fd_t->dns_hostname), "%s", addr);
+            if (fd_t->in_async) {
+                fd_t->dns_done = 0;
+                fd_t->status = CONNECT_DNS;
+                if (pthread_create(&fd_t->dns_thread, NULL, _resolve_host, fd_t) != 0) {
+                    luaL_error(L, "create dns thread failed");
+                    return 0;
+                }
+                return 1;
+            } else {
+                _resolve_host(fd_t);
+                if (fd_t->dns_done == -1) {
+                    luaL_error(L, "dns resolve error: %s", fd_t->dns_err);
+                    return 0;
+                }
+                ipaddr = inet_addr(fd_t->dns_ip);
             }
         }
-        ipaddr = inet_addr(ip);
-        free(ip);
     }
 
-    cutil_fd_t* fd_t = lua_newuserdata(L, sizeof(cutil_fd_t));
-    if (!fd_t) {
-        luaL_error(L, "create fd %s %d failed", addr, port);
+    if (_do_socket_connect(L, fd_t, cfg, ipaddr) != 0)
         return 0;
-    }
-    fd_t->fd = ERROR_FD;
-    fd_t->ssl = NULL;
-    fd_t->status = CONNECT_INIT;
-    fd_t->in_async = cfg->is_async;
-    fd_t->header = 0;
-    fd_t->proto = proto;
-
-    if (luaL_newmetatable(L, "https_socket")) {
-        lua_pushcfunction(L, _gc_fd);
-        lua_setfield(L, -2, "__gc");
-    }
-    lua_setmetatable(L, -2);
-
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in my_addr;
-    fd_t->fd = fd;
-
-    bzero(&my_addr, sizeof(my_addr));
-    my_addr.sin_addr.s_addr = ipaddr;
-    my_addr.sin_family = AF_INET;
-    my_addr.sin_port = htons(port);
-
-    int ret;
-    struct timeval timeo;
-    timeo.tv_sec = cfg->snd_tmo / 1000;
-    timeo.tv_usec = (cfg->snd_tmo % 1000) * 1000;
-    socklen_t len = sizeof(timeo);
-    ret = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeo, len);
-    if (ret) {
-        luaL_error(L, "set send timeout failed");
-        return 0;
-    }
-    timeo.tv_sec = cfg->rcv_tmo / 1000;
-    timeo.tv_usec = (cfg->rcv_tmo % 1000) * 1000;
-    ret = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeo, len);
-    if (ret) {
-        luaL_error(L, "set recv timeout failed");
-        return 0;
-    }
-
-    int reuse = 1;
-    ret = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    if (ret) {
-        luaL_error(L, "set reuse failed");
-        return 0;
-    }
-
-    if (fd_t->in_async) {
-        int flag = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flag | O_NONBLOCK);
-    }
-
-    ret = connect(fd, (struct sockaddr *)&my_addr, sizeof(struct sockaddr_in));
-    if (ret != 0) {
-        if (errno != EINPROGRESS) {
-            luaL_error(L, "connect %s %d failed", addr, port);
-            return 0;
-        }
-    }
-
-    if (fd_t->proto == PROTO_HTTP) {
-        if (!fd_t->in_async)
-            fd_t->status = CONNECT_DONE;
-        else
-            fd_t->status = CONNECT_PORT;
-        return 1;
-    }
-
-    SSL *ssl = SSL_new(cfg->ctx);
-    if (!ssl) {
-        luaL_error(L, "ssl_new error, errno = %d", errno);
-        return 0;
-    }
-    fd_t->ssl = ssl;
-    fd_t->status = CONNECT_SSL;
-    SSL_set_fd(ssl, fd);
-    if (host) {
-        SSL_set_tlsext_host_name(ssl, host);
-    }
-
-    ret = _connect_ssl(L, fd_t);
-    if (!fd_t->in_async) {
-        if (ret != 0) {
-            luaL_error(L, "ssl_connect fail");
-            return 0;
-        }
-        fd_t->status = CONNECT_DONE;
-    }
     return 1;
 }
 
@@ -366,6 +397,20 @@ static int lcheck_connect(lua_State *L) {
     cutil_fd_t* fd_t = (cutil_fd_t* ) lua_touserdata(L, 1);
     if (!fd_t) {
         luaL_error(L, "fd error");
+        return 0;
+    }
+
+    if (fd_t->status == CONNECT_DNS) {
+        if (fd_t->dns_done == -1) {
+            luaL_error(L, "dns resolve error: %s", fd_t->dns_err);
+            return 0;
+        }
+        if (fd_t->dns_done != 1) {
+            return 0;
+        }
+        in_addr_t ipaddr = inet_addr(fd_t->dns_ip);
+        if (_do_socket_connect(L, fd_t, cfg, ipaddr) != 0)
+            return 0;
         return 0;
     }
 
@@ -686,6 +731,7 @@ static int lset_ip(lua_State *L) {
     return 0;
 }
 
+// dns resolve, return ip addr, blocking
 static int ldns_resolve(lua_State *L) {
     cutil_conf_t* cfg = fetch_config(L);
     if (!cfg) return 0;
@@ -696,14 +742,14 @@ static int ldns_resolve(lua_State *L) {
         return 0;
     }
 
-    // todo getaddrinfo blocking
-    char* ip = _resolve_host(L, domain);
-    if (!ip) {
-        luaL_error(L, "resolve host fail:%s", domain);
+    cutil_fd_t* fd_t = lua_newuserdata(L, sizeof(cutil_fd_t));
+    snprintf(fd_t->dns_hostname, sizeof(fd_t->dns_hostname), "%s", domain);
+    _resolve_host(fd_t);
+    if (fd_t->dns_done == -1) {
+        luaL_error(L, "dns resolve error: %s", fd_t->dns_err);
         return 0;
     }
-    lua_pushstring(L, ip);
-    free(ip);
+    lua_pushstring(L, fd_t->dns_ip);
     return 1;
 }
 
